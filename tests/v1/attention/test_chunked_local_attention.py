@@ -202,3 +202,26 @@ def test_local_attention_virtual_batches(test_data: LocalAttentionTestData):
     print(f"Actual block table:\n{result.block_table_tensor}")
 
     torch.testing.assert_close(result.block_table_tensor, expected_block_table_tensor)
+
+
+def test_local_attention_virtual_batches_preserves_prefill_lifecycle():
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(query_lens=[4, 10, 5], seq_lens=[6, 17, 9]),
+        block_size=2,
+        device=device,
+        arange_block_indices=True,
+    )
+    common_attn_metadata.is_prefilling = torch.tensor(
+        [True, False, True], dtype=torch.bool, device=device
+    )
+
+    result, _ = make_local_attention_virtual_batches(4, common_attn_metadata, 2)
+
+    # Requests expand into [2, 4, 2] local blocks respectively.
+    expected = torch.tensor(
+        [True, True, False, False, False, False, True, True],
+        dtype=torch.bool,
+        device=device,
+    )
+    torch.testing.assert_close(result.is_prefilling, expected)

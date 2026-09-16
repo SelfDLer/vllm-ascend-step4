@@ -105,6 +105,7 @@ def mixed_small_metadata():
 # Tests for _make_metadata_with_slice
 def test_make_metadata_with_slice_decode_batch(small_decode_metadata):
     """Test slicing decode batch metadata"""
+    small_decode_metadata.is_prefilling = torch.tensor([False] * 5)
     # Split first request only
     ubatch_slice = UBatchSlice(slice(0, 1), slice(0, 1))
 
@@ -116,10 +117,13 @@ def test_make_metadata_with_slice_decode_batch(small_decode_metadata):
     assert result.max_query_len == 1
     assert torch.equal(result.query_start_loc, torch.tensor([0, 1]))
     assert torch.equal(result.seq_lens, torch.tensor([32]))
+    assert result.is_prefilling is not None
+    assert result.is_prefilling.tolist() == [False]
 
 
 def test_make_metadata_with_slice_mixed_batch(mixed_small_metadata):
     """Test slicing mixed batch metadata"""
+    mixed_small_metadata.is_prefilling = torch.tensor([False, False, True])
     ubatch_slice = UBatchSlice(slice(1, 3), slice(1, 7))  # Requests 1-3, tokens 1-7
 
     result = _make_metadata_with_slice(ubatch_slice, mixed_small_metadata)
@@ -129,6 +133,22 @@ def test_make_metadata_with_slice_mixed_batch(mixed_small_metadata):
     assert result.max_query_len == 5
     assert torch.equal(result.query_start_loc, torch.tensor([0, 1, 6]))
     assert torch.equal(result.seq_lens, torch.tensor([40, 48]))
+    assert result.is_prefilling is not None
+    assert result.is_prefilling.tolist() == [False, True]
+
+
+def test_unpadded_preserves_prefill_phase(small_decode_metadata):
+    small_decode_metadata.is_prefilling = torch.tensor(
+        [False, True, False, True, False]
+    )
+
+    result = small_decode_metadata.unpadded(
+        num_actual_tokens=1,
+        num_actual_reqs=1,
+    )
+
+    assert result.is_prefilling is not None
+    assert result.is_prefilling.tolist() == [False]
 
 
 def test_split_attn_metadata_decode_batch(large_decode_metadata):
@@ -228,6 +248,23 @@ def test_split_decodes_and_prefills_nonuniform_mixed_batch():
     assert num_prefills == 4  # 5, 6, 7, 8 are all > 4
     assert num_decode_tokens == 10  # 2 + 1 + 3 + 4
     assert num_prefill_tokens == 26  # 5 + 6 + 7 + 8
+
+
+@pytest.mark.parametrize("reset_replay", [False, True])
+def test_mtp_q1_reset_replay_classification(reset_replay):
+    metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 101], query_lens=[2, 1]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    metadata.is_prefilling = torch.tensor([False, reset_replay])
+    result = split_decodes_and_prefills(
+        metadata, decode_threshold=2, treat_short_extends_as_decodes=False
+    )
+    if reset_replay:
+        assert result == (1, 1, 2, 1)
+    else:
+        assert result == (2, 0, 3, 0)
 
 
 def test_split_decodes_and_prefills_uniform_all_ones():
@@ -397,8 +434,8 @@ def test_prefill_split_across_ubatches(
         assert int(second_meta.seq_lens[j]) == seq_lens[orig_idx]
 
 
-def test_build_attention_metadata_zeros_stale_is_prefilling():
-    """_build_attention_metadata zeroes is_prefilling for padded rows."""
+def test_build_attention_metadata_preserves_async_prefill_phase():
+    """Async attention metadata keeps the exact host-side prefill phase."""
     from unittest.mock import MagicMock, patch
 
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -419,32 +456,33 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
     runner.attn_groups = [[]]  # empty inner list: inner loop never runs
     runner.input_batch.num_computed_tokens_cpu_tensor = num_computed
     runner.input_batch.num_prompt_tokens_cpu_tensor = num_prompt
+    runner.input_batch.is_prefilling = torch.tensor(
+        [False, True, False, True, True], dtype=torch.bool
+    )
     runner.optimistic_seq_lens_cpu = torch.tensor([100, 200, 300, 0, 0])
     runner.query_start_loc.gpu = torch.zeros(num_reqs_padded + 1, dtype=torch.int32)
     runner.query_start_loc.cpu = torch.zeros(num_reqs_padded + 1, dtype=torch.int32)
     runner.seq_lens = torch.zeros(num_reqs_padded, dtype=torch.int32)
     runner.positions = torch.zeros(num_reqs_padded, dtype=torch.int64)
     runner.routed_experts_initialized = False
-    runner.use_async_spec_decode = False
+    runner.use_async_spec_decode = True
     runner.dcp_world_size = 1
-    runner.speculative_config = None
+    runner.speculative_config = object()
+    runner.drafter = object()
     runner.is_mm_prefix_lm = False
     runner._get_encoder_seq_lens.return_value = (None, None)
 
-    # Intercept CommonAttentionMetadata construction to capture is_prefilling.
-    # With speculative_config=None the constructor is called exactly once (for
-    # cm_base), so captured reflects what the fix produced before storage.
-    captured_is_prefilling = None
-    original_init = CommonAttentionMetadata.__init__
+    captured: dict[str, CommonAttentionMetadata] = {}
+    original_unpadded = CommonAttentionMetadata.unpadded
 
-    def capturing_init(self, *args, **kwargs):
-        nonlocal captured_is_prefilling
-        if "is_prefilling" in kwargs:
-            captured_is_prefilling = kwargs["is_prefilling"]
-        original_init(self, *args, **kwargs)
+    def capturing_unpadded(self, *args, **kwargs):
+        captured["producer"] = self
+        result = original_unpadded(self, *args, **kwargs)
+        captured["unpadded"] = result
+        return result
 
-    with patch.object(CommonAttentionMetadata, "__init__", capturing_init):
-        GPUModelRunner._build_attention_metadata(
+    with patch.object(CommonAttentionMetadata, "unpadded", capturing_unpadded):
+        _, spec_decode_metadata = GPUModelRunner._build_attention_metadata(
             runner,
             num_tokens=num_reqs,
             num_reqs=num_reqs,
@@ -454,9 +492,100 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
             slot_mappings={0: torch.zeros(num_reqs_padded, dtype=torch.int64)},
         )
 
-    assert captured_is_prefilling is not None
+    producer_metadata = captured["producer"]
+    unpadded_metadata = captured["unpadded"]
+    assert spec_decode_metadata is unpadded_metadata
+    captured_is_prefilling = producer_metadata.is_prefilling
+    assert isinstance(captured_is_prefilling, torch.Tensor)
+    assert producer_metadata._seq_lens_cpu is None
+    assert unpadded_metadata._seq_lens_cpu is None
+    assert unpadded_metadata.is_prefilling is not None
+    assert unpadded_metadata.is_prefilling.tolist() == [False, True, False]
     assert not captured_is_prefilling[0]  # decode  (50 >= 50)
     assert captured_is_prefilling[1]  # prefill (100 < 200)
     assert not captured_is_prefilling[2]  # decode  (200 >= 200)
     assert not captured_is_prefilling[3]  # stale data (10 < 100) zeroed
     assert not captured_is_prefilling[4]  # stale data (20 < 200) zeroed
+
+
+def test_build_attention_metadata_does_not_cache_across_ubatches():
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    class Builder:
+        supports_update_block_table = True
+
+        def __init__(self, ubatch_id):
+            self.ubatch_id = ubatch_id
+            self.build_calls = 0
+            self.update_calls = 0
+
+        def build(self, common_prefix_len, common_attn_metadata):
+            self.build_calls += 1
+            return SimpleNamespace(ubatch_id=self.ubatch_id)
+
+        def update_block_table(self, metadata, block_table, slot_mapping):
+            self.update_calls += 1
+            return metadata
+
+    builders = [Builder(0), Builder(1)]
+    attn_group = SimpleNamespace(
+        layer_names=["layer"],
+        get_metadata_builder=lambda ubatch_id=0: builders[ubatch_id],
+    )
+    kv_cache_spec = object()
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+    input_batch = SimpleNamespace(
+        block_table={
+            0: SimpleNamespace(
+                get_device_tensor=lambda num_reqs: block_table[:num_reqs]
+            )
+        },
+        num_computed_tokens_cpu_tensor=torch.tensor([8, 16], dtype=torch.int32),
+        num_prompt_tokens_cpu_tensor=torch.tensor([8, 16], dtype=torch.int32),
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+    )
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    runner = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=kv_cache_spec)]
+        ),
+        attn_groups=[[attn_group]],
+        input_batch=input_batch,
+        query_start_loc=SimpleNamespace(
+            gpu=query_start_loc,
+            cpu=query_start_loc.clone(),
+        ),
+        seq_lens=torch.tensor([9, 17], dtype=torch.int32),
+        optimistic_seq_lens_cpu=torch.tensor([9, 17], dtype=torch.int32),
+        positions=torch.tensor([8, 16], dtype=torch.int64),
+        routed_experts_initialized=False,
+        use_async_spec_decode=False,
+        is_mm_prefix_lm=False,
+        model_config=SimpleNamespace(rswa_window=None),
+        cache_config=SimpleNamespace(
+            use_replayssm=False,
+            kv_sharing_fast_prefill=False,
+        ),
+        dcp_world_size=1,
+        speculative_config=None,
+        _get_encoder_seq_lens=lambda *args, **kwargs: (None, None),
+    )
+
+    metadata, _ = GPUModelRunner._build_attention_metadata(
+        runner,
+        num_tokens=2,
+        num_reqs=2,
+        max_query_len=1,
+        ubatch_slices=[
+            UBatchSlice(slice(0, 1), slice(0, 1)),
+            UBatchSlice(slice(1, 2), slice(1, 2)),
+        ],
+        slot_mappings={0: torch.tensor([0, 1], dtype=torch.int64)},
+    )
+
+    assert [builder.build_calls for builder in builders] == [1, 1]
+    assert [builder.update_calls for builder in builders] == [0, 0]
+    assert metadata[0]["layer"].ubatch_id == 0
+    assert metadata[1]["layer"].ubatch_id == 1

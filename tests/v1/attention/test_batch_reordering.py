@@ -14,6 +14,7 @@ class MockInputBatch:
         self.req_ids = req_ids
         self.num_computed_tokens_cpu = num_computed_tokens_cpu
         self.num_prompt_tokens = num_prompt_tokens
+        self.is_prefilling = num_computed_tokens_cpu < num_prompt_tokens
 
     def swap_states(self, i, j):
         self.req_ids[i], self.req_ids[j] = self.req_ids[j], self.req_ids[i]
@@ -24,6 +25,10 @@ class MockInputBatch:
         self.num_prompt_tokens[i], self.num_prompt_tokens[j] = (
             self.num_prompt_tokens[j],
             self.num_prompt_tokens[i],
+        )
+        self.is_prefilling[i], self.is_prefilling[j] = (
+            self.is_prefilling[j],
+            self.is_prefilling[i],
         )
 
 
@@ -194,3 +199,23 @@ def test_reorder_batch_to_split_decodes_and_prefills(test_case: ReorderTestCase)
     assert input_batch.req_ids == expected_req_ids, (
         f"Expected order {expected_req_ids}, got {input_batch.req_ids}"
     )
+
+
+def test_reorder_batch_uses_prefill_lifecycle_state_for_reset_replay():
+    # Reset-prefix replay can have a fully recomputed prompt while generated
+    # output tokens still need to be replayed. It must remain in the
+    # short-extend region even when its query length is one.
+    input_batch = MockInputBatch(
+        req_ids=["reset", "decode"],
+        num_computed_tokens_cpu=np.array([100, 50], dtype=np.int32),
+        num_prompt_tokens=np.array([100, 50], dtype=np.int32),
+    )
+    input_batch.is_prefilling[:] = [True, False]
+    scheduler_output = MockSchedulerOutput({"reset": 1, "decode": 1})
+
+    modified = reorder_batch_to_split_decodes_and_prefills(
+        input_batch, scheduler_output, decode_threshold=1
+    )
+
+    assert modified
+    assert input_batch.req_ids == ["decode", "reset"]

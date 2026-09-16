@@ -7,7 +7,8 @@ import pytest
 from vllm.config import CUDAGraphMode, ProfilerConfig
 from vllm.config.profiler import _is_uri_path
 from vllm.profiler.wrapper import WorkerProfiler
-from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.utils import compute_iteration_details
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -280,6 +281,36 @@ class TestAnnotateProfile:
         assert self._annotate(detailed=True) == (
             "execute_5_context_1(sq4sk4sqsq16sqsk16)_generation_1(sq1sk11sqsq1sqsk11)"
         )
+
+
+def test_reset_replay_is_context_in_iteration_details():
+    """Replay of an already-generated request remains a context chunk."""
+    cached = CachedRequestData(
+        req_ids=["replay"],
+        resumed_req_ids={"replay"},
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[0],
+        num_output_tokens=[8],
+        is_prefill_chunk=[True],
+    )
+    sched = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached,
+        num_scheduled_tokens={"replay": 4},
+        total_num_scheduled_tokens=4,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    details = compute_iteration_details(sched)
+    assert details.num_ctx_requests == 1
+    assert details.num_ctx_tokens == 4
+    assert details.num_generation_requests == 0
 
 
 def test_profiler_entered_during_capture():

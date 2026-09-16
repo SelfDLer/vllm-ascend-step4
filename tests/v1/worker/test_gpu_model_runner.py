@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -46,7 +47,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.worker.block_table import (
+    BlockTable,
     MultiGroupBlockTable,
     SlotMappingMode,
     get_block_table_width,
@@ -61,6 +64,116 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_mask_dummy_slot_mappings_disables_all_kv_group_writes():
+    slot_mappings = {
+        0: torch.tensor([1, 2, 3], dtype=torch.int64),
+        1: torch.tensor([4, 5, 6], dtype=torch.int64),
+    }
+
+    GPUModelRunner._mask_dummy_slot_mappings(slot_mappings)
+
+    assert all(
+        torch.equal(mapping, torch.full_like(mapping, -1))
+        for mapping in slot_mappings.values()
+    )
+
+
+def test_clear_device_rows_preserves_cpu_block_table():
+    device_rows = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32)
+    cpu_rows = np.array([[7, 8], [9, 10], [11, 12]], dtype=np.int32)
+    table = SimpleNamespace(
+        block_table=SimpleNamespace(gpu=device_rows, np=cpu_rows),
+    )
+
+    BlockTable.clear_device_rows(table, 2)
+
+    assert torch.equal(device_rows[:2], torch.zeros_like(device_rows[:2]))
+    assert torch.equal(device_rows[2], torch.tensor([11, 12], dtype=torch.int32))
+    assert np.array_equal(cpu_rows, [[7, 8], [9, 10], [11, 12]])
+
+
+def test_clear_device_rows_covers_all_kv_groups():
+    tables = [SimpleNamespace(clear_device_rows=Mock()) for _ in range(3)]
+    block_tables = SimpleNamespace(block_tables=tables)
+
+    MultiGroupBlockTable.clear_device_rows(block_tables, 4)
+
+    for table in tables:
+        table.clear_device_rows.assert_called_once_with(4)
+
+
+@pytest.mark.cpu_test
+def test_step3p5_slot_mapping_keeps_per_group_real_forward_mappings():
+    """Explicit target mappings must not collapse distinct draft KV groups."""
+    proposer = SimpleNamespace(
+        draft_attn_groups=[
+            SimpleNamespace(kv_cache_group_id=0, layer_names=["mtp.0"]),
+            SimpleNamespace(kv_cache_group_id=1, layer_names=["mtp.1"]),
+        ],
+        _per_group_slot_mappings={
+            0: torch.tensor([1, 2, 3], dtype=torch.int64),
+            1: torch.tensor([11, 12, 13], dtype=torch.int64),
+        },
+        _slot_mapping_buffer=torch.full((4,), 99, dtype=torch.int64),
+    )
+
+    mappings = Step3p5MTPProposer._get_slot_mapping(
+        proposer, 3, torch.tensor([21, 22, 23], dtype=torch.int64)
+    )
+
+    assert torch.equal(mappings["mtp.0"], torch.tensor([1, 2, 3]))
+    assert torch.equal(mappings["mtp.1"], torch.tensor([11, 12, 13]))
+
+
+@pytest.mark.cpu_test
+def test_step3p5_slot_mapping_initializes_stable_group_buffers():
+    proposer = SimpleNamespace(
+        _per_group_block_tables={},
+        _per_group_slot_mappings={},
+        draft_attn_groups=[
+            SimpleNamespace(kv_cache_group_id=0, layer_names=["mtp.0"]),
+        ],
+    )
+    stable_slots = torch.tensor([31, 32, 33], dtype=torch.int64)
+    block_table = SimpleNamespace(slot_mapping=SimpleNamespace(gpu=stable_slots))
+
+    Step3p5MTPProposer.set_per_group_attn_metadata(proposer, 0, block_table)
+    mappings = Step3p5MTPProposer._get_slot_mapping(
+        proposer, 3, torch.tensor([41, 42, 43], dtype=torch.int64)
+    )
+
+    assert mappings["mtp.0"].data_ptr() == stable_slots.data_ptr()
+    assert torch.equal(mappings["mtp.0"], stable_slots)
+
+
+def test_external_launcher_idle_dp_dummy_disables_kv_cache_writes(monkeypatch):
+    dummy_run = Mock()
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        routed_experts_initialized=False,
+        speculative_config=None,
+        synchronize_input_prep=nullcontext,
+        _update_states=lambda _scheduler_output: None,
+        parallel_config=SimpleNamespace(
+            distributed_executor_backend="external_launcher",
+            data_parallel_size=2,
+        ),
+        _dummy_run=dummy_run,
+    )
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "has_kv_transfer_group",
+        lambda: False,
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "has_ec_transfer", lambda: False)
+
+    output = GPUModelRunner.execute_model(runner, scheduler_output)
+
+    assert output is EMPTY_MODEL_RUNNER_OUTPUT
+    dummy_run.assert_called_once_with(1, disable_kv_cache_writes=True)
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
@@ -126,6 +239,27 @@ def get_vllm_config():
     return vllm_config
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("num_mtp_layers", "expected"),
+    [(1, True), (3, False)],
+)
+def test_multi_module_mtp_outer_breakable_cudagraph_gate(
+    num_mtp_layers,
+    expected,
+):
+    speculative_config = SimpleNamespace(
+        use_multi_module_mtp=lambda: num_mtp_layers > 1
+    )
+
+    assert (
+        gpu_model_runner_module._can_wrap_drafter_model_with_breakable_cudagraph(
+            speculative_config
+        )
+        is expected
+    )
+
+
 @pytest.fixture
 def model_runner():
     vllm_config = get_vllm_config()
@@ -183,6 +317,7 @@ def _schedule_cached_requests(
     new_token_ids: list[list[int]],
     num_computed_tokens: list[int],
     num_output_tokens: list[int],
+    is_prefill_chunk: list[bool] | None = None,
 ) -> SchedulerOutput:
     return SchedulerOutput(
         scheduled_new_reqs=[],
@@ -194,6 +329,7 @@ def _schedule_cached_requests(
             new_block_ids=[None] * len(req_ids),
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            is_prefill_chunk=[] if is_prefill_chunk is None else is_prefill_chunk,
         ),
         num_scheduled_tokens=num_scheduled_tokens,
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
@@ -434,6 +570,8 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    assert model_runner.input_batch.is_prefilling[req_index]
 
 
 def test_update_states_request_finished(model_runner, dist_init):
@@ -496,12 +634,16 @@ def test_update_states_request_resumed(model_runner, dist_init):
     # resume req
     cached_req_data = CachedRequestData(
         req_ids=[req_id],
-        resumed_req_ids=set(),
+        # Exercise the actual preemption-resume branch.  An empty set only
+        # tests an unscheduled running request and would miss MR1805 state
+        # restoration.
+        resumed_req_ids={req_id},
         new_token_ids=[[]],
         all_token_ids={},
         new_block_ids=[([0],)],
         num_computed_tokens=[0],
         num_output_tokens=[0],
+        is_prefill_chunk=[True],
     )
 
     scheduler_output = SchedulerOutput(
@@ -522,6 +664,81 @@ def test_update_states_request_resumed(model_runner, dist_init):
     assert _is_req_added(model_runner, req_id)
     assert _is_req_scheduled(model_runner, req_id)
     assert _is_req_state_block_table_match(model_runner, req_id)
+
+    # Once the prompt has been fully replayed, the cached worker state returns
+    # to normal decode classification.
+    scheduler_output = _schedule_cached_requests(
+        [req_id], {req_id: 1}, [[]], [3], [0], is_prefill_chunk=[False]
+    )
+    model_runner._update_states(scheduler_output)
+    req_index = model_runner.input_batch.req_id_to_index[req_id]
+    assert not model_runner.input_batch.is_prefilling[req_index]
+
+    # KV-load failure recompute is carried as an explicit lifecycle state even
+    # when resumed_req_ids is empty.
+    scheduler_output = _schedule_cached_requests(
+        [req_id], {req_id: 1}, [[]], [2], [0], is_prefill_chunk=[True]
+    )
+    model_runner._update_states(scheduler_output)
+    assert model_runner.input_batch.is_prefilling[req_index]
+
+
+def test_update_streaming_request_resets_prefill_state(model_runner, dist_init):
+    req_id = "req_0"
+    model_runner._update_states(_schedule_new_request(req_id))
+    req_state = model_runner.requests[req_id]
+    model_runner._update_states(
+        _schedule_cached_requests(
+            [req_id], {req_id: 1}, [[]], [3], [0], is_prefill_chunk=[False]
+        )
+    )
+    assert not model_runner.input_batch.is_prefilling[0]
+
+    streaming_req = NewRequestData(
+        req_id=req_id,
+        prompt_token_ids=[1, 2, 3, 4],
+        mm_features=[],
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        block_ids=([0],),
+        num_computed_tokens=3,
+        lora_request=None,
+    )
+    scheduled = _schedule_new_request(req_id)
+    scheduled.scheduled_new_reqs = [streaming_req]
+    scheduled.num_scheduled_tokens = {req_id: 1}
+    scheduled.total_num_scheduled_tokens = 1
+    model_runner._update_states(scheduled)
+    updated = model_runner.requests[req_id]
+
+    assert updated is req_state
+    assert updated.num_prompt_tokens == 4
+    assert updated.num_computed_tokens == 3
+    assert model_runner.input_batch.is_prefilling[0]
+
+
+def test_update_states_prefill_lifecycle_survives_compaction(model_runner, dist_init):
+    model_runner._update_states(_schedule_new_request("gone", "decode", "replay"))
+    # Equal counters can represent decode or the final reset replay chunk.
+    model_runner._update_states(
+        _schedule_cached_requests(
+            ["decode", "replay"],
+            {"decode": 1, "replay": 1},
+            [[], []],
+            [3, 3],
+            [0, 0],
+            is_prefill_chunk=[False, True],
+        )
+    )
+    batch = model_runner.input_batch
+    assert not batch.is_prefilling[batch.req_id_to_index["decode"]]
+    assert batch.is_prefilling[batch.req_id_to_index["replay"]]
+    assert not batch.is_prefilling[2:].any()
+
+    # A new request reuses a vacated slot without inheriting its prior phase.
+    model_runner._update_states(_schedule_new_request("replacement"))
+    assert batch.is_prefilling[0]
+    assert not batch.is_prefilling[1:].any()
 
 
 def test_get_nans_in_logits(model_runner, dist_init):
@@ -582,6 +799,34 @@ def test_get_nans_in_logits(model_runner, dist_init):
     )
     result = model_runner._get_nans_in_logits(logits)
     assert result == {"req_0": 2, "req_1": 0}
+
+
+def test_randomized_dummy_input_ids_use_effective_vocab_size(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1)
+    )
+    runner.model_config = SimpleNamespace(get_valid_vocab_size=lambda: 5)
+    runner.input_ids = SimpleNamespace(gpu=torch.zeros(4, dtype=torch.int64))
+    input_ids = torch.zeros(2, dtype=torch.int64)
+    seen_high: list[int] = []
+
+    def fake_randint_like(tensor, *, low, high):
+        assert low == 0
+        seen_high.append(high)
+        return torch.full_like(tensor, high - 1)
+
+    monkeypatch.setattr(torch, "randint_like", fake_randint_like)
+
+    with runner.maybe_randomize_inputs(
+        input_ids,
+        inputs_embeds=None,
+        randomize_inputs=True,
+    ):
+        assert input_ids.tolist() == [4, 4]
+
+    assert seen_high == [5]
+    assert input_ids.tolist() == [0, 0]
 
 
 def test_update_states_no_changes(model_runner, dist_init):
@@ -893,6 +1138,96 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
         dim=0,
     )
     assert torch.equal(passed_draft_probs, expected_draft_probs)
+
+
+def test_dummy_sampler_run_warms_speculative_runtime_variants(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None)
+    )
+    runner.model = SimpleNamespace(compute_logits=Mock(return_value=torch.randn(3, 8)))
+    runner.sampler = Mock(return_value="sampler_output")
+    runner.sampler.logprobs_mode = "processed_logprobs"
+    runner.speculative_config = SimpleNamespace(
+        rejection_sample_method="standard",
+        draft_sample_method="greedy",
+        disable_padded_drafter_batch=False,
+    )
+    runner.rejection_sampler = Mock()
+    padded_next_token_warmup = Mock()
+    eagle_step_warmup = Mock()
+    block_table_tensor = torch.zeros((3, 8), dtype=torch.int32)
+    block_table = SimpleNamespace(
+        get_device_tensor=Mock(return_value=block_table_tensor)
+    )
+    runner.drafter = SimpleNamespace(
+        warmup_prepare_next_token_ids_padded=padded_next_token_warmup,
+        warmup_eagle_step_slot_mapping=eagle_step_warmup,
+        kv_cache_gid=0,
+        block_size=64,
+    )
+    runner.input_batch = SimpleNamespace(
+        valid_vocab_size=7,
+        block_table=SimpleNamespace(block_tables=[block_table]),
+    )
+    synchronize = Mock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+
+    output = GPUModelRunner._dummy_sampler_run(runner, torch.randn(3, 4))
+
+    assert output == "sampler_output"
+    assert runner.rejection_sampler.call_count == 2
+    mixed_metadata = runner.rejection_sampler.call_args_list[0].args[3]
+    all_greedy_metadata = runner.rejection_sampler.call_args_list[1].args[3]
+    assert not mixed_metadata.all_greedy
+    assert mixed_metadata.temperature is not None
+    assert all_greedy_metadata.all_greedy
+    assert not all_greedy_metadata.all_random
+    assert all_greedy_metadata.temperature is None
+    padded_next_token_warmup.assert_called_once_with(3, 7)
+    block_table.get_device_tensor.assert_called_once_with(3)
+    eagle_step_warmup.assert_called_once_with(3, block_table_tensor)
+    synchronize.assert_called_once_with()
+
+
+def test_dummy_sampler_run_skips_disabled_padded_drafter_warmup(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None)
+    )
+    runner.model = SimpleNamespace(compute_logits=Mock(return_value=torch.randn(1, 8)))
+    runner.sampler = Mock(return_value="sampler_output")
+    runner.sampler.logprobs_mode = "processed_logprobs"
+    runner.speculative_config = SimpleNamespace(
+        rejection_sample_method="standard",
+        draft_sample_method="greedy",
+        disable_padded_drafter_batch=True,
+    )
+    runner.rejection_sampler = Mock()
+    padded_next_token_warmup = Mock()
+    eagle_step_warmup = Mock()
+    block_table_tensor = torch.zeros((1, 8), dtype=torch.int32)
+    block_table = SimpleNamespace(
+        get_device_tensor=Mock(return_value=block_table_tensor)
+    )
+    runner.drafter = SimpleNamespace(
+        warmup_prepare_next_token_ids_padded=padded_next_token_warmup,
+        warmup_eagle_step_slot_mapping=eagle_step_warmup,
+        kv_cache_gid=0,
+        block_size=64,
+    )
+    runner.input_batch = SimpleNamespace(
+        valid_vocab_size=7,
+        block_table=SimpleNamespace(block_tables=[block_table]),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", Mock())
+
+    GPUModelRunner._dummy_sampler_run(runner, torch.randn(1, 4))
+
+    padded_next_token_warmup.assert_not_called()
+    eagle_step_warmup.assert_called_once_with(1, block_table_tensor)
 
 
 def test_invalid_draft_suffixes_remain_rejected_in_metadata():
@@ -1530,6 +1865,14 @@ def test_is_uniform_decode() -> None:
         num_tokens=16,
         num_reqs=15,
     )
+    # A q1 prefix-hit or chunked prefill is not a uniform decode.
+    assert not GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        is_decode_only=False,
+    )
     # Spec decoding
     assert GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=5,
@@ -1570,6 +1913,15 @@ def test_is_uniform_decode() -> None:
         num_tokens=16,
         num_reqs=15,
         force_uniform_decode=True,
+    )
+    # Explicit capture/spec-decode overrides remain authoritative.
+    assert GPUModelRunner._is_uniform_decode(
+        max_num_scheduled_tokens=1,
+        uniform_decode_query_len=1,
+        num_tokens=16,
+        num_reqs=16,
+        force_uniform_decode=True,
+        is_decode_only=False,
     )
     assert not GPUModelRunner._is_uniform_decode(
         max_num_scheduled_tokens=1,

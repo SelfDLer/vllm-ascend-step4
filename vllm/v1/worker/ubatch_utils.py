@@ -242,6 +242,11 @@ def _make_metadata_with_slice(
         max_seq_len=max_seq_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
+        is_prefilling=(
+            attn_metadata.is_prefilling[request_slice]
+            if attn_metadata.is_prefilling is not None
+            else None
+        ),
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,

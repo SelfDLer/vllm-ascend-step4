@@ -1183,3 +1183,98 @@ def test_placeholder_draft_token_rejected_random(rejection_sampler):
     assert sampled[0, 1].item() == vocab_size - 1
     recovered = sampled[0, 2].item()
     assert 0 <= recovered < vocab_size
+
+
+@pytest.mark.skipif(
+    current_platform.is_cpu(),
+    reason="Exercises Triton addressing, not the unchanged native CPU sampler.",
+)
+@pytest.mark.parametrize("draft_vocab_size", [2, 4, 6])
+def test_different_draft_vocab_accepts_matching_distributions(
+    rejection_sampler, draft_vocab_size
+):
+    """Matching distributions accept every draft, including the bonus token.
+
+    Guard storage keeps incorrect target-stride reads inside the allocation.
+    """
+    vocab_size = 4
+    output_tokens = [[0, 3], [1, 3]]
+    logits = create_logits_tensor(output_tokens, vocab_size=vocab_size)
+    draft_storage = torch.zeros(
+        2 * max(vocab_size, draft_vocab_size), device=DEVICE_TYPE
+    )
+    draft_probs = draft_storage[: 2 * draft_vocab_size].view(2, draft_vocab_size)
+    draft_probs[0, 0] = 1
+    draft_probs[1, 1] = 1
+    metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(2, device=DEVICE_TYPE),
+    )
+    spec_metadata = create_spec_decode_metadata([[0], [1]], logits)
+    mock_sampler_output(rejection_sampler, torch.tensor([3, 3], device=DEVICE_TYPE))
+
+    sampled = rejection_sampler(spec_metadata, draft_probs, logits, metadata)
+
+    assert sampled.sampled_token_ids.tolist() == output_tokens
+
+
+@pytest.mark.skipif(
+    current_platform.is_cpu(),
+    reason="Exercises Triton addressing, not the unchanged native CPU sampler.",
+)
+@pytest.mark.parametrize("use_fp64_gumbel", [False, True])
+def test_recovered_tokens_respects_wider_draft_vocab(use_fp64_gumbel):
+    """Recovery uses each draft row, not the preceding row's padded tail."""
+    draft_probs = torch.zeros((2, 6), device=DEVICE_TYPE)
+    draft_probs[0, 4] = 1
+    draft_probs[1, 1] = 1
+    target_probs = torch.tensor(
+        [[0, 0, 1, 0], [0.5, 0.5, 0, 0]], device=DEVICE_TYPE
+    )
+    metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(2, device=DEVICE_TYPE),
+    )
+
+    recovered = sample_recovered_tokens(
+        1,
+        [1, 1],
+        torch.tensor([1, 2], dtype=torch.int32, device=DEVICE_TYPE),
+        torch.tensor([4, 1], dtype=torch.int32, device=DEVICE_TYPE),
+        draft_probs,
+        target_probs,
+        metadata,
+        torch.device(DEVICE_TYPE),
+        use_fp64_gumbel=use_fp64_gumbel,
+    )
+
+    assert recovered.tolist() == [2, 0]
+
+
+@pytest.mark.skipif(
+    current_platform.is_cpu(),
+    reason="Exercises Triton addressing, not the unchanged native CPU sampler.",
+)
+@pytest.mark.parametrize("no_draft_probs", [False, True])
+def test_out_of_target_vocab_draft_recovers_eos(rejection_sampler, no_draft_probs):
+    """An unsupported draft must not borrow the next row's mass and skip EOS."""
+    vocab_size = 4
+    eos_token_id = 2
+    logits = create_logits_tensor([[eos_token_id, 3], [0, 3]], vocab_size=vocab_size)
+    draft_probs = None
+    if not no_draft_probs:
+        draft_probs = torch.zeros((2, 6), device=DEVICE_TYPE)
+        draft_probs[0, vocab_size] = 1
+        draft_probs[1, 0] = 1
+    metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(2, device=DEVICE_TYPE),
+    )
+    spec_metadata = create_spec_decode_metadata([[vocab_size], [0]], logits)
+    mock_sampler_output(rejection_sampler, torch.tensor([3, 3], device=DEVICE_TYPE))
+
+    sampled = rejection_sampler(spec_metadata, draft_probs, logits, metadata)
+    parsed, _ = RejectionSampler.parse_output(sampled.sampled_token_ids, vocab_size)
+
+    assert sampled.sampled_token_ids.tolist() == [[eos_token_id, -1], [0, 3]]
+    assert parsed == [[eos_token_id], [0, 3]]

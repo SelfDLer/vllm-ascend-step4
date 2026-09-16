@@ -304,3 +304,49 @@ def test_get_ast_full_name_handles_names_attributes_and_other_nodes() -> None:
 
     assert get_ast_full_name(dotted_expr.value) == "foo.bar.baz"
     assert get_ast_full_name(call_expr.value) is None
+
+
+def test_deep_gemm_profile_warmup_is_idempotent(monkeypatch):
+    from vllm.model_executor.warmup import kernel_warmup
+
+    calls = []
+    model = object()
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+    )
+    monkeypatch.setattr(kernel_warmup.envs, "VLLM_USE_DEEP_GEMM", True)
+    monkeypatch.setattr(kernel_warmup.envs, "VLLM_DEEP_GEMM_WARMUP", "full")
+    monkeypatch.setattr(kernel_warmup, "is_deep_gemm_supported", lambda: True)
+    monkeypatch.setattr(
+        kernel_warmup, "deep_gemm_warmup", lambda *args: calls.append(args)
+    )
+
+    kernel_warmup.deep_gemm_kernel_warmup(worker)
+    kernel_warmup.deep_gemm_kernel_warmup(worker)
+
+    assert calls == [(model, 128)]
+
+
+def test_deep_gemm_failed_profile_warmup_can_retry(monkeypatch):
+    from vllm.model_executor.warmup import kernel_warmup
+
+    worker = SimpleNamespace(
+        get_model=lambda: object(),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+    )
+    monkeypatch.setattr(kernel_warmup.envs, "VLLM_USE_DEEP_GEMM", True)
+    monkeypatch.setattr(kernel_warmup.envs, "VLLM_DEEP_GEMM_WARMUP", "full")
+    monkeypatch.setattr(kernel_warmup, "is_deep_gemm_supported", lambda: True)
+
+    def fail_warmup(*args):
+        raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(kernel_warmup, "deep_gemm_warmup", fail_warmup)
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        kernel_warmup.deep_gemm_kernel_warmup(worker)
+    assert not getattr(worker, "_deep_gemm_warmup_done", False)
+
+    monkeypatch.setattr(kernel_warmup, "deep_gemm_warmup", lambda *args: None)
+    kernel_warmup.deep_gemm_kernel_warmup(worker)
+    assert worker._deep_gemm_warmup_done

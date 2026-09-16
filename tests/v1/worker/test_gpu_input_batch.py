@@ -353,6 +353,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
     for req_index in range(batch_size):
         req: CachedRequestState = _construct_cached_request_state(req_index)
         assigned_req_index = input_batch.add_request(req)
+        input_batch.is_prefilling[assigned_req_index] = req_index % 2 == 0
         assert assigned_req_index == req_index
         reqs.append(req)
         req_id_reqs[req.req_id] = req
@@ -369,6 +370,7 @@ def test_swap_states_in_input_batch(device: str, batch_size: int, swap_list: lis
     for req_index in range(batch_size):
         req = reordered_reqs[req_index]
         assigned_req_index = ref_input_batch.add_request(req)
+        ref_input_batch.is_prefilling[assigned_req_index] = reqs.index(req) % 2 == 0
         assert assigned_req_index == req_index
 
     input_batch.refresh_metadata()
@@ -474,6 +476,60 @@ def test_placeholder_spec_token_ids_written_verbatim():
     assert input_batch.token_ids_cpu[0, 3:6].tolist() == [13, -1, -1]
 
 
+def test_valid_vocab_size_controls_sampling_metadata():
+    valid_vocab_size = 1000
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=8,
+        max_num_batched_tokens=8,
+        device=torch.device("cpu"),
+        vocab_size=VOCAB_SIZE,
+        valid_vocab_size=valid_vocab_size,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        max_num_blocks_per_req=[1],
+    )
+    req = CachedRequestState(
+        req_id="req",
+        prompt_token_ids=[10, 11],
+        mm_features=[],
+        sampling_params=SamplingParams(
+            top_k=-1,
+            logprobs=-1,
+            allowed_token_ids=[10, 11],
+        ),
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[],
+    )
+
+    input_batch.add_request(req)
+    metadata = input_batch._make_sampling_metadata()
+
+    assert input_batch.top_k_cpu[0] == valid_vocab_size
+    assert metadata.top_k is None
+    assert metadata.max_num_logprobs == valid_vocab_size
+    assert metadata.allowed_token_ids_mask is not None
+    assert metadata.allowed_token_ids_mask.shape[-1] == valid_vocab_size
+
+
+@pytest.mark.parametrize("valid_vocab_size", [0, -1, VOCAB_SIZE + 1])
+def test_invalid_valid_vocab_size_is_rejected(valid_vocab_size):
+    with pytest.raises(ValueError, match="valid_vocab_size"):
+        InputBatch(
+            max_num_reqs=1,
+            max_model_len=8,
+            max_num_batched_tokens=8,
+            device=torch.device("cpu"),
+            vocab_size=VOCAB_SIZE,
+            valid_vocab_size=valid_vocab_size,
+            block_sizes=[16],
+            kernel_block_sizes=[16],
+            max_num_blocks_per_req=[1],
+        )
+
+
 @pytest.mark.parametrize(
     ("pooling_params", "expect_device_prompt_token_ids", "expect_cpu_prompt_token_ids"),
     [
@@ -517,3 +573,100 @@ def test_pooling_metadata_token_id_buffers(
         assert metadata.get_prompt_token_ids_cpu()[0].tolist() == req.prompt_token_ids
     else:
         assert metadata.prompt_token_ids_cpu is None
+
+
+def test_pooling_requires_token_ids_survives_condense():
+    """Per-row pooling metadata must move with a condensed request."""
+    from vllm.pooling_params import PoolingParams
+
+    input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=MAX_PROMPT_SIZE,
+        max_num_batched_tokens=2 * MAX_PROMPT_SIZE,
+        device=torch.device("cpu"),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        max_num_blocks_per_req=[64],
+        is_pooling_model=True,
+    )
+    first = _construct_pooling_request(0, PoolingParams(task="classify"))
+    retained = _construct_pooling_request(
+        1, PoolingParams(task="classify", requires_token_ids=True)
+    )
+    input_batch.add_request(first)
+    input_batch.add_request(retained)
+    input_batch.remove_request(first.req_id)
+    input_batch.condense()
+    input_batch.refresh_metadata()
+
+    metadata = input_batch.get_pooling_metadata()
+    assert metadata.prompt_token_ids is not None
+    assert metadata.get_prompt_token_ids()[0].tolist() == retained.prompt_token_ids
+
+
+def _sampling_request(req_id: str, allowed_token_ids: list[int] | None):
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=[10, 11],
+        sampling_params=SamplingParams(allowed_token_ids=allowed_token_ids),
+        pooling_params=None,
+        mm_features=[],
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=[],
+    )
+
+
+def test_allowed_token_mask_source_slot_cleared_after_condense():
+    """Condense must move the mask and clear the vacated source row."""
+    input_batch = InputBatch(
+        max_num_reqs=3,
+        max_model_len=8,
+        max_num_batched_tokens=24,
+        device=torch.device("cpu"),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        max_num_blocks_per_req=[1],
+    )
+    removed = _sampling_request("removed", [1])
+    moved = _sampling_request("moved", [2])
+    unrestricted = _sampling_request("unrestricted", None)
+    input_batch.add_request(removed)
+    input_batch.add_request(moved)
+    input_batch.remove_request(removed.req_id)
+    input_batch.condense()
+
+    condensed_masks = input_batch._make_sampling_metadata().allowed_token_ids_mask
+    assert condensed_masks is not None
+    assert not condensed_masks[0, 2]
+    assert condensed_masks[0].sum() == VOCAB_SIZE - 1
+
+    input_batch.add_request(unrestricted)
+
+    metadata = input_batch._make_sampling_metadata()
+    assert metadata.allowed_token_ids_mask is not None
+    assert not metadata.allowed_token_ids_mask[1].any()
+
+
+def test_allowed_token_masks_swap_without_aliasing():
+    input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=8,
+        max_num_batched_tokens=16,
+        device=torch.device("cpu"),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        max_num_blocks_per_req=[1],
+    )
+    input_batch.add_request(_sampling_request("first", [1]))
+    input_batch.add_request(_sampling_request("second", [2]))
+    input_batch.swap_states(0, 1)
+
+    masks = input_batch._make_sampling_metadata().allowed_token_ids_mask
+    assert masks is not None
+    assert not masks[0, 2] and masks[0, 1]
+    assert not masks[1, 1] and masks[1, 2]

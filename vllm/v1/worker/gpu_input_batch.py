@@ -108,6 +108,7 @@ class InputBatch:
         reasoning_config: ReasoningConfig | None = None,
         use_replayssm: bool = False,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        valid_vocab_size: int | None = None,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
             reasoning_config,
@@ -123,6 +124,15 @@ class InputBatch:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.device = device
         self.vocab_size = vocab_size
+        self.valid_vocab_size = (
+            vocab_size if valid_vocab_size is None else valid_vocab_size
+        )
+        if not 0 < self.valid_vocab_size <= self.vocab_size:
+            raise ValueError(
+                "valid_vocab_size must be positive and no greater than "
+                f"vocab_size ({self.vocab_size}), got "
+                f"{self.valid_vocab_size}."
+            )
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -163,6 +173,12 @@ class InputBatch:
             pin_memory=PIN_MEMORY,
         )
         self.num_prompt_tokens = self.num_prompt_tokens_cpu_tensor.numpy()
+        self.is_prefilling = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.bool,
+            pin_memory=PIN_MEMORY,
+        )
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
@@ -363,6 +379,16 @@ class InputBatch:
             self.req_output_token_ids[req_index] = request.output_token_ids
             self.spec_token_ids[req_index].clear()
 
+        # A reused row must not retain state from the previous request.  Most
+        # per-request arrays are overwritten below, but these optional maps
+        # are only populated for selected request types.
+        self.req_prompt_embeds.pop(req_index, None)
+        self.logits_processing_needs_token_ids[req_index] = False
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            # False means unrestricted; allowed-token requests fill the row
+            # with True below before clearing their allowed IDs.
+            self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
+
         self.req_id_to_index[req_id] = req_index
 
         # Copy the prompt token ids and output token ids.
@@ -410,10 +436,10 @@ class InputBatch:
             if sampling_params.top_p < 1:
                 self.top_p_reqs.add(req_id)
             top_k = sampling_params.top_k
-            if 0 < top_k < self.vocab_size:
+            if 0 < top_k < self.valid_vocab_size:
                 self.top_k_reqs.add(req_id)
             else:
-                top_k = self.vocab_size
+                top_k = self.valid_vocab_size
             self.top_k_cpu[req_index] = top_k
             self.frequency_penalties_cpu[req_index] = sampling_params.frequency_penalty
             if sampling_params.frequency_penalty != 0.0:
@@ -434,7 +460,7 @@ class InputBatch:
 
             if sampling_params.logprobs is not None:
                 self.num_logprobs[req_id] = (
-                    self.vocab_size
+                    self.valid_vocab_size
                     if sampling_params.logprobs == -1
                     else sampling_params.logprobs
                 )
@@ -450,13 +476,13 @@ class InputBatch:
                     # False means we don't fill with -inf.
                     self.allowed_token_ids_mask = torch.zeros(
                         self.max_num_reqs,
-                        self.vocab_size,
+                        self.valid_vocab_size,
                         dtype=torch.bool,
                         device=self.device,
                     )
                     self.allowed_token_ids_mask_cpu_tensor = torch.zeros(
                         self.max_num_reqs,
-                        self.vocab_size,
+                        self.valid_vocab_size,
                         dtype=torch.bool,
                         device="cpu",
                     )
@@ -545,6 +571,8 @@ class InputBatch:
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
+        self.req_prompt_embeds.pop(req_index, None)
+        self.logits_processing_needs_token_ids[req_index] = False
         self.block_table.clear_row(req_index)
 
         # LoRA
@@ -623,6 +651,14 @@ class InputBatch:
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
         )
+        self.is_prefilling[[i1, i2]] = self.is_prefilling[[i2, i1]]
+        (
+            self.logits_processing_needs_token_ids[i1],
+            self.logits_processing_needs_token_ids[i2],
+        ) = (
+            self.logits_processing_needs_token_ids[i2],
+            self.logits_processing_needs_token_ids[i1],
+        )
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -692,13 +728,13 @@ class InputBatch:
         swap_dict_values(self.bad_words_token_ids, i1, i2)
 
         if self.allowed_token_ids_mask_cpu_tensor is not None:
-            (
-                self.allowed_token_ids_mask_cpu_tensor[i1],
-                self.allowed_token_ids_mask_cpu_tensor[i2],
-            ) = (
-                self.allowed_token_ids_mask_cpu_tensor[i2],
-                self.allowed_token_ids_mask_cpu_tensor[i1],
+            # Indexing a tensor row returns a view; tuple assignment would
+            # alias the first write and duplicate one mask into both rows.
+            mask_i1 = self.allowed_token_ids_mask_cpu_tensor[i1].clone()
+            self.allowed_token_ids_mask_cpu_tensor[i1].copy_(
+                self.allowed_token_ids_mask_cpu_tensor[i2]
             )
+            self.allowed_token_ids_mask_cpu_tensor[i2].copy_(mask_i1)
 
     def _get_active_token_count(self, req_index: int) -> int:
         return int(self.num_tokens_no_spec[req_index]) + len(
@@ -772,6 +808,8 @@ class InputBatch:
                 self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
                     last_req_index
                 )
+            else:
+                self.req_prompt_embeds.pop(empty_index, None)
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
                 last_req_index
             ]
@@ -783,6 +821,15 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            self.logits_processing_needs_token_ids[empty_index] = (
+                self.logits_processing_needs_token_ids[last_req_index]
+            )
+            self.logits_processing_needs_token_ids[last_req_index] = False
+            if self.allowed_token_ids_mask_cpu_tensor is not None:
+                self.allowed_token_ids_mask_cpu_tensor[empty_index].copy_(
+                    self.allowed_token_ids_mask_cpu_tensor[last_req_index]
+                )
+                self.allowed_token_ids_mask_cpu_tensor[last_req_index].fill_(False)
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
@@ -818,12 +865,6 @@ class InputBatch:
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator
-
-            # TODO convert these to LogitsProcessors
-            if self.allowed_token_ids_mask_cpu_tensor is not None:
-                self.allowed_token_ids_mask_cpu_tensor[empty_index] = (
-                    self.allowed_token_ids_mask_cpu_tensor[last_req_index]
-                )
 
             bad_words_token_ids = self.bad_words_token_ids.pop(last_req_index, None)
             if bad_words_token_ids is not None:
@@ -996,10 +1037,10 @@ class InputBatch:
         )
         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
         prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]
-        # Use the value of vocab_size as a pad since we don't have a
+        # Use the value of valid_vocab_size as a pad since we don't have a
         # token_id of this value.
         for i in range(num_reqs):
-            prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.vocab_size
+            prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.valid_vocab_size
         return prompt_token_ids_cpu_tensor
 
     def make_lora_inputs(
