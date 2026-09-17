@@ -207,19 +207,115 @@ def test_step4_dsa_attention_is_a_piecewise_compilation_split_op():
     assert compilation_config.splitting_ops_contain_attention()
 
 
+def _step4_cudagraph_config(
+    *,
+    method="mtp",
+    spec_tokens=3,
+    dynamic_schedule=None,
+    use_v2=False,
+    ubatching=False,
+    dcp_size=1,
+    parallel_drafting=False,
+):
+    speculative_config = (
+        None
+        if method is None
+        else SimpleNamespace(
+            method=method,
+            num_speculative_tokens=spec_tokens,
+            num_speculative_tokens_per_batch_size=dynamic_schedule,
+            parallel_drafting=parallel_drafting,
+        )
+    )
+    return SimpleNamespace(
+        speculative_config=speculative_config,
+        use_v2_model_runner=use_v2,
+        parallel_config=SimpleNamespace(
+            use_ubatching=ubatching,
+            decode_context_parallel_size=dcp_size,
+        ),
+    )
+
+
+def test_step4_dsa_advertises_uniform_batch_for_mtp3():
+    support = Step4DSAMetadataBuilder.get_cudagraph_support(
+        _step4_cudagraph_config(spec_tokens=3), None
+    )
+
+    assert support == AttentionCGSupport.UNIFORM_BATCH
+
+
 @pytest.mark.parametrize(
-    ("decode_query_len", "expected_mode"),
+    "config",
     [
-        (1, CUDAGraphMode.FULL_AND_PIECEWISE),
-        (4, CUDAGraphMode.PIECEWISE),
+        _step4_cudagraph_config(method=None),
+        _step4_cudagraph_config(method="eagle"),
+        _step4_cudagraph_config(spec_tokens=0),
+        _step4_cudagraph_config(spec_tokens=1),
+        _step4_cudagraph_config(spec_tokens=2),
+        _step4_cudagraph_config(spec_tokens=4),
+        _step4_cudagraph_config(dynamic_schedule=[(1, 8, 2)]),
+        _step4_cudagraph_config(parallel_drafting=True),
+        _step4_cudagraph_config(use_v2=True),
+        _step4_cudagraph_config(ubatching=True),
+        _step4_cudagraph_config(dcp_size=2),
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=3,
+                parallel_drafting=False,
+            ),
+            use_v2_model_runner=False,
+            parallel_config=SimpleNamespace(
+                use_ubatching=False,
+                decode_context_parallel_size=1,
+            ),
+        ),
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=3,
+                num_speculative_tokens_per_batch_size=None,
+            ),
+            use_v2_model_runner=False,
+            parallel_config=SimpleNamespace(
+                use_ubatching=False,
+                decode_context_parallel_size=1,
+            ),
+        ),
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=3,
+                num_speculative_tokens_per_batch_size=None,
+                parallel_drafting=False,
+            ),
+            use_v2_model_runner=False,
+            parallel_config=SimpleNamespace(),
+        ),
+        SimpleNamespace(),
     ],
 )
-def test_step4_dsa_routes_multirow_verifiers_out_of_full_cudagraph(
+def test_step4_dsa_cudagraph_support_fails_closed(config):
+    support = Step4DSAMetadataBuilder.get_cudagraph_support(config, None)
+
+    assert support == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+
+@pytest.mark.parametrize(
+    ("config", "decode_query_len", "expected_mode"),
+    [
+        (_step4_cudagraph_config(method=None), 1, CUDAGraphMode.FULL_AND_PIECEWISE),
+        (_step4_cudagraph_config(method=None), 4, CUDAGraphMode.PIECEWISE),
+        (_step4_cudagraph_config(), 4, CUDAGraphMode.FULL_AND_PIECEWISE),
+    ],
+)
+def test_step4_dsa_resolves_full_cudagraph_only_for_supported_decode(
+    config,
     decode_query_len: int,
     expected_mode: CUDAGraphMode,
 ):
-    support = Step4DSAMetadataBuilder.get_cudagraph_support(None, None)
-    assert support == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    support = Step4DSAMetadataBuilder.get_cudagraph_support(config, None)
 
     compilation_config = CompilationConfig(
         mode=CompilationMode.VLLM_COMPILE,
@@ -230,7 +326,7 @@ def test_step4_dsa_routes_multirow_verifiers_out_of_full_cudagraph(
         support,
         Step4DSAAttentionBackend.get_name(),
         uniform_decode_query_len=decode_query_len,
-        use_v2_model_runner=True,
+        use_v2_model_runner=config.use_v2_model_runner,
     )
 
     assert resolved_mode == expected_mode
@@ -2237,6 +2333,253 @@ def _make_step4_mtp_cuda_state():
     return cache, owner, mtp
 
 
+def _step4_mtp_persistent_tensors(cache):
+    transaction_state = (
+        "row_regions",
+        "row_positions",
+        "row_source",
+        "row_owner_block",
+        "row_owner_block_index",
+        "correction_action",
+        "state_numerator",
+        "state_denominator",
+        "state_max_logits",
+        "state_pre_numerator",
+        "state_pre_denominator",
+        "state_pre_max_logits",
+        "source_to_transaction",
+    )
+    tensors = {
+        f"cache.{name}": value
+        for name, value in vars(cache).items()
+        if isinstance(value, torch.Tensor)
+    }
+    transaction = cache._step4_mtp_transaction
+    tensors.update(
+        {
+            f"transaction.{name}": getattr(transaction, name)
+            for name in transaction_state
+        }
+    )
+    return tensors
+
+
+def _clone_step4_mtp_persistent_state(cache):
+    return {
+        name: value.clone()
+        for name, value in _step4_mtp_persistent_tensors(cache).items()
+    }
+
+
+def _assert_step4_mtp_persistent_state(cache, expected):
+    actual = _step4_mtp_persistent_tensors(cache)
+    assert actual.keys() == expected.keys()
+    for name, expected_value in expected.items():
+        assert torch.equal(actual[name], expected_value), name
+
+
+def _step4_mtp_live_transaction_rows(cache):
+    transaction = cache._step4_mtp_transaction
+    rows = {}
+    live_indices = (
+        torch.nonzero(transaction.row_regions >= 0, as_tuple=False).flatten().tolist()
+    )
+    key_fields = (
+        "row_owner_block_index",
+        "row_owner_block",
+        "row_positions",
+        "row_regions",
+    )
+    state_fields = (
+        "row_source",
+        "correction_action",
+        "state_numerator",
+        "state_denominator",
+        "state_max_logits",
+        "state_pre_numerator",
+        "state_pre_denominator",
+        "state_pre_max_logits",
+    )
+    for row in live_indices:
+        key = tuple(int(getattr(transaction, name)[row].item()) for name in key_fields)
+        assert key not in rows
+        rows[key] = {
+            name: getattr(transaction, name)[row].clone() for name in state_fields
+        }
+    return rows
+
+
+def _assert_step4_mtp_semantic_state(cache, expected):
+    assert torch.equal(cache.sum_cache, expected.sum_cache)
+    assert torch.equal(cache.count_cache, expected.count_cache)
+    assert torch.equal(cache.mean_cache, expected.mean_cache)
+
+    actual_active_ids = [
+        int(region)
+        for region in cache._step4_csa_active_region_ids.tolist()
+        if region >= 0
+    ]
+    expected_active_ids = [
+        int(region)
+        for region in expected._step4_csa_active_region_ids.tolist()
+        if region >= 0
+    ]
+    actual_regions = set(actual_active_ids)
+    expected_regions = set(expected_active_ids)
+    assert len(actual_active_ids) == len(actual_regions)
+    assert len(expected_active_ids) == len(expected_regions)
+    assert actual_regions == expected_regions
+    for region in actual_regions:
+        _assert_step4_logical_region_state_equal(cache, expected, region)
+
+    actual_rows = _step4_mtp_live_transaction_rows(cache)
+    expected_rows = _step4_mtp_live_transaction_rows(expected)
+    assert actual_rows.keys() == expected_rows.keys()
+    for key, actual_state in actual_rows.items():
+        for name, actual_value in actual_state.items():
+            assert torch.equal(actual_value, expected_rows[key][name]), (key, name)
+
+
+def _make_step4_mtp_replay_step(mtp, block_table_pages=1, num_requests=1):
+    num_tokens = 4 * num_requests
+    query_start_loc = torch.arange(
+        0, num_tokens + 1, 4, device="cuda", dtype=torch.int32
+    )
+    metadata = _step4_attention_metadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=torch.zeros(num_requests, device="cuda", dtype=torch.int32),
+        block_table=torch.full(
+            (num_requests, block_table_pages),
+            -1,
+            device="cuda",
+            dtype=torch.int32,
+        ),
+        num_decode_requests=num_requests,
+        dsa_valid_requests=torch.zeros(1, device="cuda", dtype=torch.int32),
+        dsa_valid_tokens=torch.zeros(1, device="cuda", dtype=torch.int32),
+        max_query_len=4,
+    )
+    layout = _step4_mtp_cuda_layout([0] * num_tokens, [0] * num_tokens)
+    index_k = torch.zeros((num_tokens, 1, 256), device="cuda", dtype=torch.float32)
+    step = SimpleNamespace(
+        metadata=metadata,
+        layout=layout,
+        index_k=index_k,
+        index_z=torch.zeros_like(index_k),
+    )
+
+    def launch():
+        mtp.update(
+            summary_cache=mtp.owner._summary_cache,
+            attn_metadata=step.metadata,
+            layout=step.layout,
+            index_k=step.index_k,
+            index_z=step.index_z,
+            num_actual_tokens=num_tokens,
+            use_decode_update=True,
+        )
+
+    step.launch = launch
+    return step
+
+
+def _configure_step4_mtp_replay_step(step, start, *, logical_page_origin=None):
+    owner_block_index = max((start - 1) // 64, 0)
+    physical_page_origin = (
+        owner_block_index if logical_page_origin is None else logical_page_origin
+    )
+    positions = list(range(start, start + 4))
+    logical_pages = {owner_block_index, *(position // 64 for position in positions)}
+    if logical_page_origin is not None:
+        logical_pages.update(range(logical_page_origin, max(logical_pages) + 1))
+    block_table = torch.full_like(step.metadata.block_table, -1)
+    for logical_page in logical_pages:
+        assert logical_page < block_table.shape[1]
+        block_table[0, logical_page] = logical_page - physical_page_origin
+    regions = [
+        int(block_table[0, position // 64].item()) * 8 + (position % 64) // 8
+        for position in positions
+    ]
+
+    step.metadata.seq_lens.fill_(start + 4)
+    step.metadata.block_table.copy_(block_table)
+    step.metadata.dsa_valid_requests.fill_(1)
+    step.metadata.dsa_valid_tokens.fill_(4)
+    runtime_layout = _step4_mtp_cuda_layout(regions, positions)
+    step.layout.token_flat_slot.copy_(runtime_layout.token_flat_slot)
+    step.layout.token_positions.copy_(runtime_layout.token_positions)
+    step.layout.reset_slots.copy_(runtime_layout.reset_slots)
+    step.layout.token_valid.copy_(runtime_layout.token_valid)
+    step.index_k.copy_(_step4_mtp_cuda_values([0] * 4, positions))
+    step.index_z.zero_()
+
+
+def _configure_step4_mtp_batch_replay_step(step, request_starts):
+    num_slots = int(step.metadata.seq_lens.numel())
+    assert 0 <= len(request_starts) <= num_slots
+    assert step.metadata.block_table.shape[1] == 1
+
+    block_table = torch.full_like(step.metadata.block_table, -1)
+    seq_lens = torch.zeros_like(step.metadata.seq_lens)
+    regions = []
+    positions = []
+    requests = []
+    token_valid = []
+    for slot in range(num_slots):
+        if slot < len(request_starts):
+            page, start = request_starts[slot]
+            slot_positions = list(range(start, start + 4))
+            assert all(position < 64 for position in slot_positions)
+            block_table[slot, 0] = page
+            seq_lens[slot] = start + 4
+            regions.extend(
+                page * 8 + (position % 64) // 8 for position in slot_positions
+            )
+            positions.extend(slot_positions)
+            requests.extend([page] * 4)
+            token_valid.extend([True] * 4)
+        else:
+            regions.extend([0] * 4)
+            positions.extend([0] * 4)
+            requests.extend([0] * 4)
+            token_valid.extend([False] * 4)
+
+    step.metadata.seq_lens.copy_(seq_lens)
+    step.metadata.block_table.copy_(block_table)
+    step.metadata.dsa_valid_requests.fill_(len(request_starts))
+    step.metadata.dsa_valid_tokens.fill_(4 * len(request_starts))
+    runtime_layout = _step4_mtp_cuda_layout(regions, positions)
+    runtime_valid = torch.tensor(token_valid, device="cuda", dtype=torch.bool)
+    runtime_layout.token_valid.copy_(runtime_valid)
+    runtime_layout.reset_slots.masked_fill_(~runtime_valid, -1)
+    step.layout.token_flat_slot.copy_(runtime_layout.token_flat_slot)
+    step.layout.token_positions.copy_(runtime_layout.token_positions)
+    step.layout.reset_slots.copy_(runtime_layout.reset_slots)
+    step.layout.token_valid.copy_(runtime_layout.token_valid)
+    step.index_k.copy_(_step4_mtp_cuda_values(requests, positions))
+    step.index_z.zero_()
+
+
+def _seed_step4_mtp_replay_context(cache, owner, context_start, *, page=0, request=0):
+    positions = list(range(context_start, context_start + 6))
+    region = page * 8 + context_start % 64 // 8
+    values = _step4_mtp_cuda_values([request] * len(positions), positions)
+    owner._update_summary_cache_with_padded_layout(
+        summary_cache=cache,
+        layout=_step4_mtp_cuda_layout([region] * len(positions), positions),
+        index_k=values,
+        index_z=torch.zeros_like(values),
+        num_actual_tokens=len(positions),
+        proxy_dim=256,
+        use_decode_update=False,
+        query_start_loc=torch.tensor([0, 6], device="cuda", dtype=torch.int32),
+        seq_lens=torch.tensor(
+            [context_start + len(positions)], device="cuda", dtype=torch.int32
+        ),
+    )
+
+
 def _step4_mtp_cuda_layout(
     regions: list[int],
     positions: list[int],
@@ -2512,6 +2855,7 @@ def _make_step4_committed_summary_reference(
     page: int = 0,
     context_start: int = 8,
     verifier_start: int = 14,
+    logical_page_origin: int = 0,
 ) -> Step4SparseSummaryCache:
     cache, owner, _ = _make_step4_mtp_cuda_state()
     committed_positions = list(range(context_start, verifier_start + accepted_rows))
@@ -2522,7 +2866,12 @@ def _make_step4_committed_summary_reference(
     owner._update_summary_cache_with_padded_layout(
         summary_cache=cache,
         layout=_step4_mtp_cuda_layout(
-            [page * 8 + position // 8 for position in committed_positions],
+            [
+                page * 8
+                + (position // 64 - logical_page_origin) * 8
+                + (position % 64) // 8
+                for position in committed_positions
+            ],
             committed_positions,
         ),
         index_k=committed_values,
@@ -2659,6 +3008,148 @@ def test_step4_mtp_pending_correction_graph_replay_cuda():
     expected = _make_step4_committed_summary_reference(1)
     for region in (1, 2):
         _assert_step4_logical_region_state_equal(cache, expected, region)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Step4 DSA MTP requires CUDA")
+@pytest.mark.parametrize("accepted_rows", range(5))
+@pytest.mark.parametrize(
+    ("context_start", "block_table_pages", "logical_page_origin"),
+    [
+        pytest.param(8, 1, None, id="short-context"),
+        pytest.param(65528, 1025, 1023, id="64k-owner-boundary"),
+    ],
+)
+def test_step4_mtp_update_graph_replay_accept_matrix_cuda(
+    accepted_rows,
+    context_start,
+    block_table_pages,
+    logical_page_origin,
+):
+    graph_cache, graph_owner, graph_mtp = _make_step4_mtp_cuda_state()
+    reference_cache, reference_owner, reference_mtp = _make_step4_mtp_cuda_state()
+    graph_owner._summary_cache = graph_cache
+    reference_owner._summary_cache = reference_cache
+    graph_mtp.prepare_scratch(graph_cache)
+    reference_mtp.prepare_scratch(reference_cache)
+    graph_step = _make_step4_mtp_replay_step(graph_mtp, block_table_pages)
+    reference_step = _make_step4_mtp_replay_step(reference_mtp, block_table_pages)
+
+    pristine_graph_state = _clone_step4_mtp_persistent_state(graph_cache)
+    pristine_reference_state = _clone_step4_mtp_persistent_state(reference_cache)
+    graph_step.launch()
+    reference_step.launch()
+    torch.accelerator.synchronize()
+    _assert_step4_mtp_persistent_state(graph_cache, pristine_graph_state)
+    _assert_step4_mtp_persistent_state(reference_cache, pristine_reference_state)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_step.launch()
+    torch.accelerator.synchronize()
+    _assert_step4_mtp_persistent_state(graph_cache, pristine_graph_state)
+
+    _seed_step4_mtp_replay_context(graph_cache, graph_owner, context_start)
+    _seed_step4_mtp_replay_context(reference_cache, reference_owner, context_start)
+    context_boundary = context_start + 6
+    for start in (context_boundary, context_boundary + accepted_rows):
+        _configure_step4_mtp_replay_step(
+            graph_step, start, logical_page_origin=logical_page_origin
+        )
+        _configure_step4_mtp_replay_step(
+            reference_step, start, logical_page_origin=logical_page_origin
+        )
+        graph.replay()
+        reference_step.launch()
+        torch.accelerator.synchronize()
+        _assert_step4_mtp_persistent_state(
+            graph_cache, _clone_step4_mtp_persistent_state(reference_cache)
+        )
+
+    if logical_page_origin is not None:
+        transaction = graph_cache._step4_mtp_transaction
+        live_rows = transaction.row_regions >= 0
+        assert live_rows.sum().item() == 4
+        expected_owner_index = (context_boundary + accepted_rows - 1) // 64
+        expected_owner_block = expected_owner_index - logical_page_origin
+        assert transaction.row_owner_block[live_rows].eq(expected_owner_block).all()
+        assert (
+            transaction.row_owner_block_index[live_rows].eq(expected_owner_index).all()
+        )
+
+        current_start = context_boundary + accepted_rows
+        graph_mtp.correct(
+            summary_cache=graph_cache,
+            attn_metadata=SimpleNamespace(
+                query_start_loc=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                seq_lens=torch.tensor(
+                    [current_start + 1], device="cuda", dtype=torch.int32
+                ),
+                block_table=graph_step.metadata.block_table,
+                dsa_valid_requests=graph_step.metadata.dsa_valid_requests,
+            ),
+        )
+        torch.accelerator.synchronize()
+        assert transaction.row_regions.eq(-1).all()
+
+        committed = _make_step4_committed_summary_reference(
+            accepted_rows,
+            context_start=context_start,
+            verifier_start=context_boundary,
+            logical_page_origin=logical_page_origin,
+        )
+        affected_regions = {
+            (position // 64 - logical_page_origin) * 8 + (position % 64) // 8
+            for position in range(context_start, context_boundary + 4)
+        }
+        for region in affected_regions:
+            _assert_step4_logical_region_state_equal(graph_cache, committed, region)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Step4 DSA MTP requires CUDA")
+def test_step4_mtp_uniform_batch_graph_replay_handles_reorder_and_padding_cuda():
+    graph_cache, graph_owner, graph_mtp = _make_step4_mtp_cuda_state()
+    reference_cache, reference_owner, reference_mtp = _make_step4_mtp_cuda_state()
+    graph_owner._summary_cache = graph_cache
+    reference_owner._summary_cache = reference_cache
+    graph_mtp.prepare_scratch(graph_cache)
+    reference_mtp.prepare_scratch(reference_cache)
+    graph_step = _make_step4_mtp_replay_step(graph_mtp, num_requests=2)
+    reference_step = _make_step4_mtp_replay_step(reference_mtp, num_requests=2)
+
+    graph_step.launch()
+    reference_step.launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_step.launch()
+    torch.accelerator.synchronize()
+
+    _seed_step4_mtp_replay_context(graph_cache, graph_owner, 8, page=0, request=0)
+    _seed_step4_mtp_replay_context(graph_cache, graph_owner, 8, page=1, request=1)
+    _seed_step4_mtp_replay_context(
+        reference_cache, reference_owner, 8, page=0, request=0
+    )
+    _seed_step4_mtp_replay_context(
+        reference_cache, reference_owner, 8, page=1, request=1
+    )
+
+    for request_starts in (
+        [(0, 14), (1, 14)],
+        [(1, 18), (0, 16)],
+        [(0, 17)],
+    ):
+        _configure_step4_mtp_batch_replay_step(graph_step, request_starts)
+        _configure_step4_mtp_batch_replay_step(reference_step, request_starts)
+        graph.replay()
+        reference_step.launch()
+        torch.accelerator.synchronize()
+        _assert_step4_mtp_semantic_state(graph_cache, reference_cache)
+
+    transaction = graph_cache._step4_mtp_transaction
+    live_rows = transaction.row_regions >= 0
+    assert live_rows.sum().item() == 8
+    live_owner_blocks = transaction.row_owner_block[live_rows]
+    assert live_owner_blocks.eq(0).sum().item() == 4
+    assert live_owner_blocks.eq(1).sum().item() == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Step4 DSA MTP requires CUDA")

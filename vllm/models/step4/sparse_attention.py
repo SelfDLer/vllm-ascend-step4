@@ -9,9 +9,10 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
 import torch
+from typing_extensions import override
 
 from vllm import envs
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -58,6 +59,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from .mtp_state_machine import Step4KernelPlan, build_step4_kernel_plan
 from .sparse_summary_cache import (
@@ -1006,14 +1008,37 @@ class Step4DSAMetadataBuilder(FlashAttentionMetadataBuilder):
     normal block table and sequence lengths instead of using cascade metadata.
     """
 
-    # FULL graph support is validated only for ordinary q_len=1 decode. Keep
-    # multi-row MTP verification on the PIECEWISE route until its stateful DSA
-    # transaction has an explicit FULL-replay correctness contract. Advertising
-    # the narrower upstream capability avoids a Step4-specific branch in the
-    # generic model runner.
+    # Keep the default capability narrow. The config-aware override below only
+    # enables multi-row FULL replay for the validated legacy static-MTP path,
+    # without adding a Step4-specific branch to the generic model runner.
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _full_cudagraph_spec_tokens: ClassVar[int] = 3
     supports_update_block_table: bool = False
     reorder_batch_threshold: int = 1
+
+    @override  # type: ignore[misc]
+    @classmethod
+    def get_cudagraph_support(
+        cls: type[Step4DSAMetadataBuilder],
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        num_speculative_tokens = getattr(spec_config, "num_speculative_tokens", None)
+        if (
+            getattr(spec_config, "method", None) == "mtp"
+            and num_speculative_tokens == cls._full_cudagraph_spec_tokens
+            and getattr(spec_config, "num_speculative_tokens_per_batch_size", ())
+            is None
+            and not getattr(spec_config, "parallel_drafting", True)
+            and not getattr(vllm_config, "use_v2_model_runner", True)
+            and parallel_config is not None
+            and not getattr(parallel_config, "use_ubatching", True)
+            and getattr(parallel_config, "decode_context_parallel_size", 0) == 1
+        ):
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
