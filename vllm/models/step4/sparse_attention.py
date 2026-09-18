@@ -223,10 +223,16 @@ def _step4_expand_block_table_kernel(
 
 _PREFILL_REGION_VALID_SHIFT = 24
 _PREFILL_LOGITS_WORKSPACE_ELEMENTS = 128 * 1024 * 1024
-_PREFILL_Q_TILE_CAPACITY = 2048
+_PREFILL_Q_TILE_CAPACITY = 4096
 _BATCH_DECODE_Q_HEADS_PER_KV = 4
 _BATCH_DECODE_Q_RUNTIME_ROWS = 16
 _BATCH_DECODE_BLOCK_Q = 32
+# Keep this metadata launch shape stable across CUDA Graph captures. A single
+# program covers max_num_seqs=64 under MTP3 (four token rows per request), while
+# larger configured batches scale through the grid without compiling
+# request-count-specific tiles.
+_DECODE_ROW_RANGES_BLOCK_SIZE = 256
+_DECODE_ROW_RANGES_NUM_WARPS = 4
 _MTP_UNION_Q_GROUP = 4
 _MTP_UNION_SPLITS = 8
 
@@ -988,6 +994,8 @@ class Step4DSAStepMetadata:
     ) = None
     decode_request_indices: torch.Tensor | None = None
     decode_table_indices: torch.Tensor | None = None
+    decode_group_query_start_loc: torch.Tensor | None = None
+    decode_group_row_starts: torch.Tensor | None = None
     decode_row_ranges: torch.Tensor | None = None
     decode_paged_summary: tuple[torch.Tensor, torch.Tensor] | None = None
     decode_kernel_block_table: torch.Tensor | None = None
@@ -1074,12 +1082,13 @@ class Step4DSAMetadataBuilder(FlashAttentionMetadataBuilder):
         actual_num_tokens = int(common_attn_metadata.num_actual_tokens)
         self._dsa_valid_requests.fill_(actual_num_reqs)
         self._dsa_valid_tokens.fill_(actual_num_tokens)
-        metadata.num_actual_reqs = actual_num_reqs
-        metadata.dsa_valid_requests = self._dsa_valid_requests
-        metadata.dsa_valid_tokens = self._dsa_valid_tokens
-        metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        metadata.seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-        cast(Any, metadata).step4_kernel_plan = build_step4_kernel_plan(
+        step4_metadata = cast(Any, metadata)
+        step4_metadata.num_actual_reqs = actual_num_reqs
+        step4_metadata.dsa_valid_requests = self._dsa_valid_requests
+        step4_metadata.dsa_valid_tokens = self._dsa_valid_tokens
+        step4_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        step4_metadata.seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        step4_metadata.step4_kernel_plan = build_step4_kernel_plan(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
             mtp_enabled=self._mtp_enabled,
@@ -1154,8 +1163,8 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
     enabled. It executes the Step4 DSA kernel path directly.
     """
 
-    can_return_lse_for_decode: ClassVar[bool] = False
-    supports_dcp: ClassVar[bool] = False
+    can_return_lse_for_decode: ClassVar[bool] = False  # type: ignore[misc]
+    supports_dcp: ClassVar[bool] = False  # type: ignore[misc]
 
     def __init__(
         self,
@@ -1936,6 +1945,12 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             device=device,
             dtype=torch.int32,
         )
+        decode_batch_row_starts = self._get_dsa_tensor_buffer_at_least(
+            "decode_batch_row_starts",
+            (max_decode_batch,),
+            device=device,
+            dtype=torch.int32,
+        )
         self._get_dsa_tensor_buffer_at_least(
             "decode_batch_row_ends",
             (max_decode_rows,),
@@ -1962,6 +1977,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         )
         with torch.inference_mode():
             torch.arange(max_decode_rows, out=decode_batch_row_req_idx)
+            decode_batch_row_starts.zero_()
         padded_topk = topk + 1
         if 1 < self.sparse_decode_split_max < 16:
             padded_topk = self._round_up(padded_topk, self.sparse_decode_split_max)
@@ -2344,7 +2360,8 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             state_shape[:2], float("-inf"), device=device, dtype=torch.float32
         )
         stage_dtype = self._decode_out_dtype or torch.bfloat16
-        summary_cache._step4_csa_active_token_k = torch.zeros(
+        dynamic_cache = cast(Any, summary_cache)
+        dynamic_cache._step4_csa_active_token_k = torch.zeros(
             (
                 capacity,
                 int(summary_cache.region_block_size),
@@ -2354,10 +2371,10 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             device=device,
             dtype=stage_dtype,
         )
-        summary_cache._step4_csa_active_token_z = torch.zeros_like(
-            summary_cache._step4_csa_active_token_k
+        dynamic_cache._step4_csa_active_token_z = torch.zeros_like(
+            dynamic_cache._step4_csa_active_token_k
         )
-        summary_cache._step4_csa_active_token_valid = torch.zeros(
+        dynamic_cache._step4_csa_active_token_valid = torch.zeros(
             (capacity, int(summary_cache.region_block_size)),
             device=device,
             dtype=torch.uint8,
@@ -2425,6 +2442,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             index_k = padded_index_k
             index_z = padded_index_z
         if use_decode_update:
+            dynamic_cache = cast(Any, summary_cache)
             with torch.profiler.record_function(
                 "step4_dsa.csa.compact_decode_update_op"
             ):
@@ -2437,9 +2455,9 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                     active_numerator,
                     denominator,
                     max_logits,
-                    summary_cache._step4_csa_active_token_k,
-                    summary_cache._step4_csa_active_token_z,
-                    summary_cache._step4_csa_active_token_valid,
+                    dynamic_cache._step4_csa_active_token_k,
+                    dynamic_cache._step4_csa_active_token_z,
+                    dynamic_cache._step4_csa_active_token_valid,
                     layout.token_flat_slot,
                     layout.reset_slots,
                     layout.token_valid,
@@ -2663,6 +2681,42 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             and plan.all_decode_q4_or_padding
         )
 
+    @staticmethod
+    def _decode_batch_logits_layout(
+        num_reqs: int,
+        *,
+        use_mtp_union_exact_mask: bool,
+    ) -> tuple[int, int]:
+        q_len = _MTP_UNION_Q_GROUP if use_mtp_union_exact_mask else 1
+        if num_reqs % q_len != 0:
+            raise RuntimeError(
+                "Step4 grouped decode logits received incomplete query "
+                f"groups: token_rows={num_reqs}, q_len={q_len}."
+            )
+        return num_reqs // q_len, q_len
+
+    @staticmethod
+    def _decode_batch_logits_group_table_indices(
+        group_query_start_loc: torch.Tensor | None,
+        *,
+        group_reqs: int,
+    ) -> torch.Tensor:
+        if (
+            group_query_start_loc is None
+            or int(group_query_start_loc.shape[0]) != group_reqs + 1
+        ):
+            raise RuntimeError(
+                "Step4 grouped decode logits received inconsistent "
+                f"request metadata: group_reqs={group_reqs}."
+            )
+        table_indices = group_query_start_loc[:-1]
+        if not table_indices.is_contiguous():
+            raise RuntimeError(
+                "Step4 grouped decode logits requires contiguous request "
+                "start metadata."
+            )
+        return table_indices
+
     def _forward_sparse_gqa_cutedsl(
         self,
         *,
@@ -2713,6 +2767,10 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
 
         if plan.use_flattened_decode:
             with torch.profiler.record_function("step4_dsa.sparse_gqa.decode_q_le4"):
+                if use_mtp_union_exact_mask:
+                    step_metadata.decode_group_query_start_loc = query_start_loc[
+                        : num_reqs + 1
+                    ]
                 # The step metadata object can survive CUDA-graph replay.
                 # Request lengths and block-table contents change even when
                 # the flattened shape stays constant, so refresh the
@@ -2756,6 +2814,10 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         if num_decode_reqs > 0:
             with torch.profiler.record_function("step4_dsa.sparse_gqa.mixed_decode"):
                 if plan.has_verifier:
+                    if use_mtp_union_exact_mask:
+                        step_metadata.decode_group_query_start_loc = query_start_loc[
+                            : num_decode_reqs + 1
+                        ]
                     step_metadata.decode_flattened = (
                         self._flatten_decode_q_le4_metadata(
                             query_start_loc=query_start_loc[: num_decode_reqs + 1],
@@ -2844,6 +2906,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         step_metadata: Step4DSAStepMetadata,
         valid_requests: torch.Tensor | None = None,
         valid_tokens: torch.Tensor | None = None,
+        use_mtp_union_exact_mask: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_reqs = int(query.shape[0])
         region_block_size = int(self.sparse_region_block_size)
@@ -2856,26 +2919,27 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         seq_lens_i32 = seq_lens
         query_start_loc_i32 = query_start_loc[: num_reqs + 1]
         if step_metadata.decode_row_ranges is None:
-            step_metadata.decode_row_ranges = self._get_dsa_tensor_buffer_at_least(
+            row_ranges = self._get_dsa_tensor_buffer_at_least(
                 "decode_meta_row_ranges",
                 (3, self._round_up(int(num_reqs), 4)),
                 device=query.device,
                 dtype=torch.int32,
             )
+            row_ranges_grid = (triton.cdiv(num_reqs, _DECODE_ROW_RANGES_BLOCK_SIZE),)
+            _step4_decode_row_ranges_kernel[row_ranges_grid](
+                seq_lens_i32,
+                live_token_slots,
+                row_ranges[0, :num_reqs],
+                row_ranges[1, :num_reqs],
+                row_ranges[2, :num_reqs],
+                num_reqs,
+                num_regions,
+                REGION_BLOCK_SIZE=region_block_size,
+                BLOCK=_DECODE_ROW_RANGES_BLOCK_SIZE,
+                num_warps=_DECODE_ROW_RANGES_NUM_WARPS,
+            )
+            step_metadata.decode_row_ranges = row_ranges
         row_ranges = step_metadata.decode_row_ranges
-        block = 256
-        _step4_decode_row_ranges_kernel[(triton.cdiv(num_reqs, block),)](
-            seq_lens_i32,
-            live_token_slots,
-            row_ranges[0, :num_reqs],
-            row_ranges[1, :num_reqs],
-            row_ranges[2, :num_reqs],
-            num_reqs,
-            num_regions,
-            REGION_BLOCK_SIZE=region_block_size,
-            BLOCK=block,
-            num_warps=4,
-        )
         row_starts = row_ranges[0, :num_reqs]
         row_ends = row_ranges[1, :num_reqs]
         sanitized_seq_lens = row_ranges[2, :num_reqs]
@@ -2917,17 +2981,18 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             table_indices = request_indices
             step_metadata.decode_table_indices = table_indices
         q_heads_per_kv = int(index_q.shape[2])
-        with torch.profiler.record_function("step4_dsa.decode_meta.paged_summary"):
-            step_metadata.decode_paged_summary = (
-                build_decode_paged_summary_block_table_and_valid_step3p5(
-                    summary_cache=summary_cache,
-                    block_table=block_table,
-                    seq_lens=seq_lens_i32,
-                    live_token_slots=live_token_slots,
-                    num_regions=int(num_regions),
-                    device=query.device,
+        if step_metadata.decode_paged_summary is None:
+            with torch.profiler.record_function("step4_dsa.decode_meta.paged_summary"):
+                step_metadata.decode_paged_summary = (
+                    build_decode_paged_summary_block_table_and_valid_step3p5(
+                        summary_cache=summary_cache,
+                        block_table=block_table,
+                        seq_lens=seq_lens_i32,
+                        live_token_slots=live_token_slots,
+                        num_regions=int(num_regions),
+                        device=query.device,
+                    )
                 )
-            )
         paged_summary_block_table, decode_summary_valid = (
             step_metadata.decode_paged_summary
         )
@@ -2940,30 +3005,63 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
             )
             if q_heads_per_kv == _BATCH_DECODE_Q_HEADS_PER_KV:
                 # The batch WGMMA entrypoint carries a query-length dimension
-                # for multi-row speculative verification, so
-                # index_q/weights/row_ends/out are all [B, Q, ...]. Only the
-                # single-row decode path reaches here (the metadata builder sends
-                # max_query_len > 1 down the causal mixed path), so Q is 1.
-                q_len = 1
+                # for multi-row speculative verification, so index_q, weights,
+                # row_ends, and out are all [B, Q, ...]. The union exact-mask
+                # path has already proved that every live verifier request is
+                # q4; all other decode shapes retain the q1 layout.
+                group_reqs, q_len = self._decode_batch_logits_layout(
+                    num_reqs,
+                    use_mtp_union_exact_mask=use_mtp_union_exact_mask,
+                )
                 wgmma_n = batch_logits_wgmma_n(q_len)
                 batch_q_fp8 = self._get_dsa_tensor_buffer_at_least(
                     "decode_batch_q_fp8",
-                    (num_reqs, q_len, 1, q_heads_per_kv, 256),
+                    (group_reqs, q_len, 1, q_heads_per_kv, 256),
                     device=query.device,
                     dtype=torch.float8_e4m3fn,
                 )
                 # The batch WGMMA entrypoint consumes pre-quantized FP8 q.
-                batch_q_fp8.copy_(index_q.unsqueeze(1))
-                batch_row_req_idx = request_indices
+                batch_q_fp8.copy_(
+                    index_q.view(group_reqs, q_len, 1, q_heads_per_kv, 256)
+                )
+                if use_mtp_union_exact_mask:
+                    batch_row_req_idx = self._get_dsa_tensor_buffer_at_least(
+                        "decode_batch_row_req_idx",
+                        (group_reqs,),
+                        device=query.device,
+                        dtype=torch.int32,
+                    )
+                    if step_metadata.decode_group_row_starts is None:
+                        step_metadata.decode_group_row_starts = (
+                            self._get_dsa_tensor_buffer_at_least(
+                                "decode_batch_row_starts",
+                                (group_reqs,),
+                                device=query.device,
+                                dtype=torch.int32,
+                            )
+                        )
+                    group_row_starts = step_metadata.decode_group_row_starts
+                    batch_row_table_idx = self._decode_batch_logits_group_table_indices(
+                        step_metadata.decode_group_query_start_loc,
+                        group_reqs=group_reqs,
+                    )
+                else:
+                    batch_row_req_idx = request_indices
+                    group_row_starts = row_starts
+                    batch_row_table_idx = table_indices
                 batch_row_ends = self._get_dsa_tensor_buffer_at_least(
                     "decode_batch_row_ends",
-                    (num_reqs,),
+                    (group_reqs, q_len),
                     device=query.device,
                     dtype=torch.int32,
                 )
                 # Selector row_ends is inclusive; WGMMA consumes half-open
                 # region intervals.
-                torch.add(sanitized_seq_lens, region_block_size - 1, out=batch_row_ends)
+                torch.add(
+                    sanitized_seq_lens.view(group_reqs, q_len),
+                    region_block_size - 1,
+                    out=batch_row_ends,
+                )
                 torch.div(
                     batch_row_ends,
                     region_block_size,
@@ -2972,28 +3070,28 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                 )
                 q_runtime = self._get_dsa_tensor_buffer_at_least(
                     "decode_batch_q_runtime",
-                    (num_reqs * wgmma_n, 256),
+                    (group_reqs * wgmma_n, 256),
                     device=query.device,
                     dtype=torch.float8_e4m3fn,
                 )
                 kernel_weights = self._get_dsa_tensor_buffer_at_least(
                     "decode_batch_kernel_weights",
-                    (num_reqs, wgmma_n),
+                    (group_reqs, wgmma_n),
                     device=query.device,
                     dtype=torch.float32,
                 )
                 region_scores = batch_logits(
                     batch_q_fp8,
-                    proxy_weights.unsqueeze(1),
+                    proxy_weights.view(group_reqs, q_len, 1, q_heads_per_kv),
                     summary_cache.mean_cache,
                     paged_summary_block_table,
                     batch_row_req_idx,
-                    row_starts,
-                    batch_row_ends.unsqueeze(-1),
-                    row_table_idx=table_indices,
+                    group_row_starts,
+                    batch_row_ends,
+                    row_table_idx=batch_row_table_idx,
                     q_runtime=q_runtime,
                     kernel_weights=kernel_weights,
-                    out=region_scores_out.unsqueeze(1),
+                    out=region_scores_out.view(group_reqs, q_len, num_regions),
                     valid_requests=valid_requests,
                     valid_tokens=valid_tokens,
                 )
@@ -3039,16 +3137,19 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                 BLOCK_N=block_n,
             )
             region_scores = prepared_region_scores
-        with torch.profiler.record_function("step4_dsa.decode_meta.kernel_block_table"):
-            step_metadata.decode_kernel_block_table = (
-                self._sparse_gqa_prefill_kernel_block_table(
-                    block_table=block_table,
-                    kv_cache=kv_cache,
-                    padded_regions=padded_regions,
-                    device=query.device,
-                    scratch_name="decode_kernel_block_table",
+        if step_metadata.decode_kernel_block_table is None:
+            with torch.profiler.record_function(
+                "step4_dsa.decode_meta.kernel_block_table"
+            ):
+                step_metadata.decode_kernel_block_table = (
+                    self._sparse_gqa_prefill_kernel_block_table(
+                        block_table=block_table,
+                        kv_cache=kv_cache,
+                        padded_regions=padded_regions,
+                        device=query.device,
+                        scratch_name="decode_kernel_block_table",
+                    )
                 )
-            )
         kernel_block_table = step_metadata.decode_kernel_block_table
         region_counts = self._get_dsa_tensor_buffer_at_least(
             "decode_meta_region_counts",
@@ -3228,6 +3329,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                     step_metadata=step_metadata,
                     valid_requests=valid_requests,
                     valid_tokens=valid_tokens,
+                    use_mtp_union_exact_mask=use_mtp_union_exact_mask,
                 )
             )
         output_view = output.view(-1, self.num_heads, self.head_size)
@@ -3612,7 +3714,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         )
         num_tiles = triton.cdiv(total_prefill_tokens, tile_capacity)
         tile_union_groups = self._prefill_tile_union_group_counts(
-            query_start_loc_cpu=attn_metadata.query_start_loc_cpu,
+            query_start_loc_cpu=cast(Any, attn_metadata).query_start_loc_cpu,
             num_decode_reqs=num_decode_reqs,
             num_decode_tokens=num_decode_tokens,
             num_prefill_reqs=num_prefill_reqs,

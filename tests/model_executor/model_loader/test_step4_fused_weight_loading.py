@@ -84,6 +84,99 @@ def test_step4_fused_qknorm_requires_cuda(
     assert step4_model._can_use_step4_fused_qknorm(use_rope) is expected
 
 
+@pytest.mark.parametrize(
+    ("enabled", "num_tokens", "expected"),
+    [
+        (False, 1, False),
+        (True, 1, True),
+        (True, 256, True),
+        (True, 257, False),
+        (True, 16384, False),
+    ],
+)
+def test_step4_qknorm_cache_fusion_is_limited_to_small_workloads(
+    enabled,
+    num_tokens,
+    expected,
+):
+    assert step4_model._use_step4_qknorm_cache_fusion(enabled, num_tokens) is expected
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_path", "expected_kv_dependency"),
+    [
+        (256, "cache", "cache-write"),
+        (257, "separate", None),
+    ],
+)
+def test_step4_attention_dispatches_qknorm_at_cache_fusion_boundary(
+    monkeypatch,
+    num_tokens,
+    expected_path,
+    expected_kv_dependency,
+):
+    calls = []
+    kv_dependencies = []
+    qkv = torch.arange(num_tokens * 3, dtype=torch.float32).view(num_tokens, 3)
+
+    def cache_fusion(*args, **kwargs):
+        calls.append("cache")
+        return qkv[:, :1], qkv[:, 1:2], qkv[:, 2:], "cache-write"
+
+    def separate_fusion(*args, **kwargs):
+        calls.append("separate")
+        return qkv[:, :1], qkv[:, 1:2], qkv[:, 2:]
+
+    class FakeAttention:
+        layer_name = "layers.0.self_attn.attn"
+
+        def __call__(self, q, k, v, *, kv_cache_dummy_dep):
+            kv_dependencies.append(kv_cache_dummy_dep)
+            return q + k + v
+
+    monkeypatch.setattr(
+        step4_model,
+        "fused_qknorm_rope_cache_forward_impl",
+        cache_fusion,
+    )
+    monkeypatch.setattr(
+        step4_model,
+        "fused_qknorm_rope_forward_impl",
+        separate_fusion,
+    )
+
+    attention = SimpleNamespace(
+        use_dsa_backend=False,
+        fuse_qkv_gate=False,
+        qkv_proj=lambda hidden_states: (qkv, None),
+        use_step4_fused_qknorm_cache=True,
+        use_step4_fused_qknorm=True,
+        q_norm=SimpleNamespace(variance_epsilon=1e-5, weight=torch.ones(1)),
+        k_norm=SimpleNamespace(weight=torch.ones(1)),
+        rope_cos=torch.ones(1),
+        rope_sin=torch.zeros(1),
+        head_dim=1,
+        num_heads=1,
+        num_kv_heads=1,
+        rotary_dim=2,
+        zero_centered=False,
+        attn=FakeAttention(),
+        sparse_attn=None,
+        use_head_wise_attn_gate=False,
+        o_proj=lambda output: (output, None),
+    )
+
+    output = step4_model.Step4Attention.forward(
+        attention,
+        torch.arange(num_tokens),
+        torch.empty(num_tokens, 1),
+    )
+
+    assert calls == [expected_path]
+    assert kv_dependencies == [expected_kv_dependency]
+    torch.testing.assert_close(output, qkv.sum(dim=-1, keepdim=True))
+
+
 def test_step4_attention_quantizes_projections_but_not_kv_cache(monkeypatch):
     quant_config = object()
     projection_quant_configs = []
@@ -230,53 +323,40 @@ def test_step4_moe_reduce_policy(
     )
 
 
-@pytest.mark.parametrize("renormalize", [False, True])
-def test_step4_biased_topk(renormalize):
-    torch.manual_seed(20260916)
-    hidden_states = torch.randn(7, 16)
-    gating_output = torch.randn(7, 352)
-    gating_output[3, 17] = torch.nan
-    correction_bias = torch.randn(352) * 0.05
-    scaling_factor = 2.5
-
-    actual_weights, actual_ids = step4_model._step4_biased_topk(
-        hidden_states,
-        gating_output,
-        topk=8,
-        renormalize=renormalize,
-        e_score_correction_bias=correction_bias,
-        routed_scaling_factor=scaling_factor,
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_step4_router_bias_kernel_matches_reference(indices_dtype):
+    from vllm.models.step4.nvidia.ops.triton.router_bias import (
+        router_bias_triton_func,
     )
 
-    scores = gating_output.float().sigmoid()
+    torch.manual_seed(20260916)
+    gating_output = torch.randn(7, 352, device="cuda", dtype=torch.float32)
+    gating_output[3, 17] = torch.nan
+    gating_output[4].fill_(-46.75)
+    correction_bias = torch.randn(352, device="cuda") * 0.05
+    correction_bias[4:] += torch.arange(348, device="cuda")
+    scaling_factor = 2.5
+
+    actual_weights, actual_ids = router_bias_triton_func(
+        gating_output,
+        correction_bias,
+        topk=8,
+        renormalize=True,
+        routed_scaling_factor=scaling_factor,
+        indices_dtype=indices_dtype,
+    )
+
+    scores = gating_output.sigmoid()
     expected_ids = torch.topk(scores + correction_bias, k=8, dim=-1).indices
     expected_weights = scores.gather(1, expected_ids)
-    if renormalize:
-        expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
     expected_weights *= scaling_factor
     expected_weights[3].zero_()
     expected_ids[3].zero_()
 
     torch.testing.assert_close(actual_weights, expected_weights)
-    torch.testing.assert_close(actual_ids, expected_ids)
-
-
-def test_step4_biased_topk_preserves_tiny_weight_normalization():
-    gating_output = torch.full((1, 4), -46.75)
-    correction_bias = torch.arange(4, dtype=torch.float32)
-
-    actual_weights, _ = step4_model._step4_biased_topk(
-        torch.zeros(1, 4),
-        gating_output,
-        topk=2,
-        renormalize=True,
-        e_score_correction_bias=correction_bias,
-        routed_scaling_factor=1.0,
-    )
-
-    selected_scores = gating_output.sigmoid()[:, -2:]
-    expected_weights = selected_scores / (selected_scores.sum(dim=-1) + 1e-20)
-    torch.testing.assert_close(actual_weights, expected_weights)
+    torch.testing.assert_close(actual_ids, expected_ids.to(indices_dtype))
 
 
 class _FakeMoeRunner(nn.Module):
@@ -1062,3 +1142,84 @@ def test_qknorm_cache_rotary_layout_support(
     supported,
 ):
     assert is_supported_step4_qknorm_cache_rotary(head_dim, rotary_pairs) is supported
+
+
+def test_router_bias_lazy_imports_model_scoped_kernel(monkeypatch):
+    calls = []
+    imported_modules = []
+    expected = (object(), object())
+
+    def router(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    def import_module(name):
+        imported_modules.append(name)
+        assert name == "vllm.models.step4.nvidia.ops.triton.router_bias"
+        return SimpleNamespace(router_bias_triton_func=router)
+
+    monkeypatch.setattr(step4_kernels.importlib, "import_module", import_module)
+
+    gating_output = SimpleNamespace(is_cuda=True)
+    router_bias = object()
+    actual = step4_kernels.router_bias_func(
+        object(),
+        gating_output,
+        topk=2,
+        renormalize=True,
+        router_bias=router_bias,
+        routed_scaling_factor=3.0,
+        indices_dtype=torch.int64,
+    )
+
+    assert actual is expected
+    assert imported_modules == ["vllm.models.step4.nvidia.ops.triton.router_bias"]
+    assert calls == [
+        (
+            (gating_output, router_bias, 2),
+            {
+                "renormalize": True,
+                "routed_scaling_factor": 3.0,
+                "nan_row_i_out": 0,
+                "indices_dtype": torch.int64,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_router_bias_cpu_fallback_preserves_reference_semantics(
+    monkeypatch, renormalize
+):
+    def unexpected_import(_name):
+        raise AssertionError("CPU fallback must not import the CUDA Triton kernel")
+
+    monkeypatch.setattr(step4_kernels.importlib, "import_module", unexpected_import)
+
+    gating_output = torch.tensor(
+        [[0.0, 1.0, -1.0], [float("nan"), 0.0, 1.0]], dtype=torch.float32
+    )
+    router_bias = torch.tensor([0.3, -0.2, 0.1], dtype=torch.float32)
+    weights, ids = step4_kernels.router_bias_func(
+        gating_output,
+        gating_output,
+        topk=2,
+        renormalize=renormalize,
+        router_bias=router_bias,
+        routed_scaling_factor=1.5,
+        nan_row_i_out=7,
+        indices_dtype=torch.int64,
+    )
+
+    scores = gating_output[0].sigmoid()
+    expected_ids = torch.topk(scores + router_bias, k=2).indices
+    expected_weights = scores.gather(0, expected_ids)
+    if renormalize:
+        expected_weights /= expected_weights.sum() + 1e-20
+    expected_weights *= 1.5
+
+    torch.testing.assert_close(weights[0], expected_weights)
+    torch.testing.assert_close(weights[1], torch.zeros(2))
+    assert ids.dtype == torch.int64
+    assert ids[0].tolist() == expected_ids.tolist()
+    assert ids[1].tolist() == [7, 7]

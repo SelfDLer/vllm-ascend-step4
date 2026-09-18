@@ -83,6 +83,7 @@ from .kernels import (
     fused_qknorm_rope_forward_impl,
     get_step4_sparse_config,
     is_supported_step4_qknorm_cache_rotary,
+    router_bias_func,
 )
 from .layernorm import (
     Step4IndexerLayerNorm,
@@ -91,6 +92,8 @@ from .layernorm import (
 )
 
 logger = init_logger(__name__)
+
+_STEP4_QKNORM_CACHE_FUSION_MAX_TOKENS = 256
 
 
 def step4_materialize_gate_input(tensor: torch.Tensor) -> torch.Tensor:
@@ -1031,38 +1034,14 @@ def _step4_moe_reduce_policy(tp_size: int, dp_size: int) -> tuple[bool, bool]:
     return fuse_all_reduce, not fuse_all_reduce
 
 
-@torch.compile(backend=current_platform.simple_compile_backend)
-def _step4_biased_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    *,
-    e_score_correction_bias: torch.Tensor,
-    routed_scaling_factor: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select experts using biased sigmoid scores and return unbiased weights."""
-    del hidden_states
-    scores = gating_output.float().sigmoid()
-    _, topk_ids = torch.topk(
-        scores + e_score_correction_bias.float(),
-        k=topk,
-        dim=-1,
-    )
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize:
-        topk_weights /= topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-    topk_weights *= routed_scaling_factor
-
-    invalid_rows = gating_output.isnan().any(dim=-1, keepdim=True)
-    topk_weights = torch.where(invalid_rows, 0, topk_weights)
-    topk_ids = torch.where(invalid_rows, 0, topk_ids)
-    return topk_weights, topk_ids
-
-
 def _can_use_step4_fused_qknorm(use_rope: bool) -> bool:
     """Return whether the CUDA-only fused QKNorm and RoPE path is available."""
     return use_rope and current_platform.is_cuda()
+
+
+def _use_step4_qknorm_cache_fusion(enabled: bool, num_tokens: int) -> bool:
+    """Prefer the native cache-writing fusion for decode-sized batches."""
+    return enabled and num_tokens <= _STEP4_QKNORM_CACHE_FUSION_MAX_TOKENS
 
 
 class Step4Attention(nn.Module):
@@ -1547,7 +1526,11 @@ class Step4Attention(nn.Module):
             extra_dims = None
 
         kv_cache_dummy_dep = None
-        if self.use_step4_fused_qknorm_cache:
+        # The native cache-writing kernel is optimized for decode-sized batches.
+        # Large prefills are faster with CuTeDSL QKNorm and the backend cache update.
+        if _use_step4_qknorm_cache_fusion(
+            self.use_step4_fused_qknorm_cache, qkv.shape[0]
+        ):
             eps = self.q_norm.variance_epsilon
             q, k, v, kv_cache_dummy_dep = fused_qknorm_rope_cache_forward_impl(
                 qkv,
@@ -2152,8 +2135,8 @@ class Step4MoE(nn.Module):
         # Step4 selects experts with a correction bias but computes routed
         # weights from the unbiased sigmoid scores.
         custom_routing_function = functools.partial(
-            _step4_biased_topk,
-            e_score_correction_bias=self.router_bias,
+            router_bias_func,
+            router_bias=self.router_bias,
             routed_scaling_factor=config.moe_router_scaling_factor,
         )
         self.experts = FusedMoEFactory(

@@ -4,6 +4,7 @@
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -413,6 +414,54 @@ def test_step4_mtp_union_decode_requires_uniform_q4_verifiers(
 
 
 @pytest.mark.parametrize(
+    ("rows", "use_mtp_union_exact_mask", "expected"),
+    [(32, True, (8, 4)), (64, True, (16, 4)), (32, False, (32, 1))],
+)
+def test_step4_decode_logits_groups_uniform_q4_verifiers(
+    rows,
+    use_mtp_union_exact_mask,
+    expected,
+):
+    assert (
+        Step4DSAAttentionImpl._decode_batch_logits_layout(
+            rows,
+            use_mtp_union_exact_mask=use_mtp_union_exact_mask,
+        )
+        == expected
+    )
+
+
+def test_step4_decode_logits_rejects_incomplete_q4_group():
+    with pytest.raises(RuntimeError, match="incomplete query groups"):
+        Step4DSAAttentionImpl._decode_batch_logits_layout(
+            6,
+            use_mtp_union_exact_mask=True,
+        )
+
+
+def test_step4_decode_logits_uses_contiguous_group_table_indices():
+    query_start_loc = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+
+    table_indices = Step4DSAAttentionImpl._decode_batch_logits_group_table_indices(
+        query_start_loc,
+        group_reqs=3,
+    )
+
+    assert table_indices.tolist() == [0, 4, 8]
+    assert table_indices.is_contiguous()
+
+
+def test_step4_decode_logits_rejects_strided_group_table_indices():
+    flattened_query_start_loc = torch.arange(13, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="contiguous request start metadata"):
+        Step4DSAAttentionImpl._decode_batch_logits_group_table_indices(
+            flattened_query_start_loc[::4],
+            group_reqs=3,
+        )
+
+
+@pytest.mark.parametrize(
     ("rows", "use_mtp_union_exact_mask", "expected_path"),
     [(4, True, "union"), (5, True, "direct"), (4, False, "direct")],
 )
@@ -521,9 +570,9 @@ def test_step4_mixed_verifier_prefill_uses_separate_request_and_token_prefixes(
 ):
     impl = object.__new__(Step4DSAAttentionImpl)
     impl.sparse_region_block_size = 8
-    decode_calls: list[dict[str, object]] = []
-    prefill_calls: list[dict[str, object]] = []
-    flatten_calls: list[dict[str, object]] = []
+    decode_calls: list[dict[str, Any]] = []
+    prefill_calls: list[dict[str, Any]] = []
+    flatten_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
         impl,
@@ -543,11 +592,12 @@ def test_step4_mixed_verifier_prefill_uses_separate_request_and_token_prefixes(
         )
 
     monkeypatch.setattr(impl, "_flatten_decode_q_le4_metadata", flatten)
-    monkeypatch.setattr(
-        impl,
-        "_forward_sparse_gqa_cutedsl_decode",
-        lambda **kwargs: decode_calls.append(kwargs) or kwargs["output"],
-    )
+
+    def record_decode(**kwargs):
+        decode_calls.append(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(impl, "_forward_sparse_gqa_cutedsl_decode", record_decode)
     monkeypatch.setattr(
         impl,
         "_forward_sparse_gqa_prefill_tiles",
@@ -613,9 +663,9 @@ def test_step4_mixed_q1_short_prefill_uses_prefill_suffix(
     )
     impl = object.__new__(Step4DSAAttentionImpl)
     impl.sparse_region_block_size = 8
-    decode_calls: list[dict[str, object]] = []
-    prefill_calls: list[dict[str, object]] = []
-    flatten_calls: list[dict[str, object]] = []
+    decode_calls: list[dict[str, Any]] = []
+    prefill_calls: list[dict[str, Any]] = []
+    flatten_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
         impl,
@@ -627,11 +677,12 @@ def test_step4_mixed_q1_short_prefill_uses_prefill_suffix(
         "_flatten_decode_q_le4_metadata",
         lambda **kwargs: flatten_calls.append(kwargs),
     )
-    monkeypatch.setattr(
-        impl,
-        "_forward_sparse_gqa_cutedsl_decode",
-        lambda **kwargs: decode_calls.append(kwargs) or kwargs["output"],
-    )
+
+    def record_decode(**kwargs):
+        decode_calls.append(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(impl, "_forward_sparse_gqa_cutedsl_decode", record_decode)
     monkeypatch.setattr(
         impl,
         "_forward_sparse_gqa_prefill_tiles",
@@ -713,9 +764,9 @@ def test_step4_pure_short_prefill_uses_prefill_dispatch(
     )
     impl = object.__new__(Step4DSAAttentionImpl)
     impl.sparse_region_block_size = 8
-    decode_calls: list[dict[str, object]] = []
-    prefill_calls: list[dict[str, object]] = []
-    flatten_calls: list[dict[str, object]] = []
+    decode_calls: list[dict[str, Any]] = []
+    prefill_calls: list[dict[str, Any]] = []
+    flatten_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(
         impl,
@@ -735,11 +786,12 @@ def test_step4_pure_short_prefill_uses_prefill_dispatch(
         )
 
     monkeypatch.setattr(impl, "_flatten_decode_q_le4_metadata", flatten)
-    monkeypatch.setattr(
-        impl,
-        "_forward_sparse_gqa_cutedsl_decode",
-        lambda **kwargs: decode_calls.append(kwargs) or kwargs["output"],
-    )
+
+    def record_decode(**kwargs):
+        decode_calls.append(kwargs)
+        return kwargs["output"]
+
+    monkeypatch.setattr(impl, "_forward_sparse_gqa_cutedsl_decode", record_decode)
     monkeypatch.setattr(
         impl,
         "_forward_sparse_gqa_prefill_tiles",
@@ -1630,7 +1682,13 @@ def test_step4_cow_invalidates_destination_transaction_but_preserves_source():
 
 @pytest.mark.parametrize(
     ("max_tokens", "padded_regions", "expected_rows"),
-    [(32768, 65536, 2048), (32768, 131072, 1024), (1025, 65536, 1028), (1, 4096, 4)],
+    [
+        (32768, 4096, 4096),
+        (32768, 65536, 2048),
+        (32768, 131072, 1024),
+        (1025, 65536, 1028),
+        (1, 4096, 4),
+    ],
 )
 def test_step4_prefill_tile_respects_logits_memory_budget(
     max_tokens, padded_regions, expected_rows
@@ -2017,7 +2075,7 @@ def test_step4_mtp_detects_q1_inside_mixed_decode_prefix(monkeypatch):
 
 
 def test_step4_mtp_mixed_verifier_prefill_splits_summary_updates(monkeypatch):
-    ordinary_calls: list[dict[str, object]] = []
+    ordinary_calls: list[dict[str, Any]] = []
 
     class Owner:
         @staticmethod
@@ -2036,7 +2094,7 @@ def test_step4_mtp_mixed_verifier_prefill_splits_summary_updates(monkeypatch):
             ordinary_calls.append(kwargs)
 
     mtp = Step4DSAMTP(Owner(), num_speculative_tokens=3)
-    verifier_calls: list[dict[str, object]] = []
+    verifier_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         mtp,
         "_update_summary_cache",
@@ -2126,7 +2184,7 @@ def test_step4_mtp_mixed_verifier_prefill_splits_summary_updates(monkeypatch):
 def test_step4_mtp_q1_verifier_prefill_masks_transaction_suffix(monkeypatch):
     """Only q2+ verifier rows may enter the transaction update."""
     buffers: dict[str, torch.Tensor] = {}
-    ordinary_calls: list[dict[str, object]] = []
+    ordinary_calls: list[dict[str, Any]] = []
 
     class Owner:
         max_num_seqs = 3
@@ -2215,7 +2273,7 @@ def test_step4_mtp_q1_verifier_prefill_masks_transaction_suffix(monkeypatch):
     )
 
     original_update = Step4DSAMTP._update_summary_cache
-    calls: list[dict[str, object]] = []
+    calls: list[dict[str, Any]] = []
 
     def wrapped_update(self, **kwargs: object) -> None:
         calls.append(kwargs)
@@ -2269,8 +2327,8 @@ def test_step4_mtp_q1_verifier_uses_mask_for_pure_verifier_transaction(
     monkeypatch,
 ):
     """A q1 row must not be replayed by a pure-verifier transaction update."""
-    ordinary_calls: list[dict[str, object]] = []
-    op_calls: list[tuple[object, ...]] = []
+    ordinary_calls: list[dict[str, Any]] = []
+    op_calls: list[tuple[Any, ...]] = []
 
     class TensorBag:
         def __init__(self, **values: object) -> None:
@@ -2281,7 +2339,7 @@ def test_step4_mtp_q1_verifier_uses_mask_for_pure_verifier_transaction(
             setattr(self, name, value)
             return value
 
-    owner = TensorBag(max_num_seqs=2)
+    owner: Any = TensorBag(max_num_seqs=2)
     owner._get_dsa_tensor_buffer_at_least = lambda _name, shape, *, device, dtype: (
         torch.zeros(
             shape,
@@ -2644,10 +2702,10 @@ def _configure_step4_mtp_batch_replay_step(step, request_starts):
 
     block_table = torch.full_like(step.metadata.block_table, -1)
     seq_lens = torch.zeros_like(step.metadata.seq_lens)
-    regions = []
-    positions = []
-    requests = []
-    token_valid = []
+    regions: list[int] = []
+    positions: list[int] = []
+    requests: list[int] = []
+    token_valid: list[bool] = []
     for slot in range(num_slots):
         if slot < len(request_starts):
             page, start = request_starts[slot]

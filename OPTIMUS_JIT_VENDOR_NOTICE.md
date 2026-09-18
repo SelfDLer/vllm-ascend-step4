@@ -116,8 +116,8 @@ absent.
 ## License status: P0 public-release gate
 
 License coverage remains incomplete across the retained closure. At the time
-of this notice, the manifest covers 54 files: 50 retained `optimus_jit` files
-and four StepFun native sources. A mechanical header scan finds 27 retained
+of this notice, the manifest covers 55 files: 51 retained `optimus_jit` files
+and four StepFun native sources. A mechanical header scan finds 28 retained
 `optimus_jit` files with an `Apache-2.0` SPDX identifier and 23 with no SPDX
 license identifier; five of the latter carry a copyright notice. All four
 StepFun native files carry an `Apache-2.0` SPDX identifier. These counts are
