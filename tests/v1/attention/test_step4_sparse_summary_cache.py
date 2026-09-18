@@ -125,6 +125,19 @@ def test_step4_csa_prefill_prewarm_is_exported_from_public_interfaces():
         assert callable(getattr(module, export_name))
 
 
+def test_step4_mtp_union_decode_is_exported_from_sparse_gqa():
+    from vllm.models.step4.nvidia.ops.cute_dsl import sparse_gqa
+
+    export_names = (
+        "build_decode_mtp_union_exact_mask_meta_sm90_gqa",
+        "merge_mtp_union_exact_mask_nat_lse_states_sm90_gqa",
+        "token_wise_flash_attn_decode_mtp_union_exact_mask_sm90_gqa_func",
+    )
+    for name in export_names:
+        assert name in sparse_gqa.__all__
+        assert callable(getattr(sparse_gqa, name))
+
+
 def test_step4_dsa_backend_does_not_inherit_unsupported_flash_capabilities():
     assert Step4DSAAttentionBackend.is_sparse()
     assert Step4DSAAttentionBackend.supports_batch_invariance()
@@ -348,6 +361,115 @@ def _step4_attention_metadata(*, num_decode_requests, **kwargs):
         mtp_enabled=True,
     )
     return metadata
+
+
+@pytest.mark.parametrize(
+    (
+        "query_lens",
+        "num_decode_requests",
+        "spec_tokens",
+        "num_heads",
+        "num_kv_heads",
+        "expected",
+    ),
+    [
+        ([4, 4], 2, 3, 16, 1, True),
+        ([4, 5], 1, 3, 16, 1, True),
+        ([1, 4], 2, 3, 16, 1, False),
+        ([2, 2], 2, 1, 16, 1, False),
+        ([3, 3], 2, 3, 16, 1, False),
+        ([1, 1], 2, 3, 16, 1, False),
+        ([4, 4], 2, 0, 16, 1, False),
+        ([4, 4], 2, 3, 8, 1, False),
+        ([4, 4], 2, 3, 4, 1, False),
+        ([4, 4], 2, 3, 16, 2, False),
+    ],
+)
+def test_step4_mtp_union_decode_requires_uniform_q4_verifiers(
+    query_lens,
+    num_decode_requests,
+    spec_tokens,
+    num_heads,
+    num_kv_heads,
+    expected,
+):
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(query_lens).cumsum(0).tolist()], dtype=torch.int32
+    )
+    metadata = _step4_attention_metadata(
+        num_decode_requests=num_decode_requests,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.clone(),
+        num_actual_tokens=int(query_start_loc[-1]),
+    )
+    impl = object.__new__(Step4DSAAttentionImpl)
+    impl.num_heads = num_heads
+    impl.num_kv_heads = num_kv_heads
+    impl._mtp = (
+        SimpleNamespace(num_speculative_tokens=spec_tokens) if spec_tokens > 0 else None
+    )
+
+    assert impl._uses_mtp_union_exact_mask(metadata.step4_kernel_plan) is expected
+
+
+@pytest.mark.parametrize(
+    ("rows", "use_mtp_union_exact_mask", "expected_path"),
+    [(4, True, "union"), (5, True, "direct"), (4, False, "direct")],
+)
+def test_step4_decode_dispatches_only_complete_q4_groups_to_union(
+    monkeypatch,
+    rows,
+    use_mtp_union_exact_mask,
+    expected_path,
+):
+    impl = object.__new__(Step4DSAAttentionImpl)
+    impl.num_heads = 16
+    impl.head_size = 128
+    impl.scale = 0.125
+    impl.sparse_topk = 16
+    impl.sparse_decode_split_max = 1
+    paths: list[str] = []
+
+    monkeypatch.setattr(
+        impl,
+        "_sparse_gqa_decode_meta_cutedsl",
+        lambda **_: (
+            torch.ones(rows, dtype=torch.int32),
+            torch.zeros((rows, 2), dtype=torch.int64),
+            torch.ones(rows, dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        impl,
+        "_sparse_gqa_decode_attn_mtp_union_exact_mask",
+        lambda **_: paths.append("union"),
+    )
+    monkeypatch.setattr(
+        step4_sparse_attention,
+        "token_wise_flash_attn_decode_sm90_gqa_func",
+        lambda *args, **kwargs: paths.append("direct"),
+    )
+    query = torch.zeros((rows, impl.num_heads, impl.head_size))
+
+    impl._forward_sparse_gqa_cutedsl_decode(
+        query=query,
+        kv_cache=torch.empty(0),
+        key_cache=torch.empty(0),
+        value_cache=torch.empty(0),
+        seq_lens=torch.ones(rows, dtype=torch.int32),
+        block_table=torch.zeros((rows, 1), dtype=torch.int32),
+        query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+        slot_mapping=torch.arange(rows),
+        output=torch.empty_like(query),
+        summary_cache=object(),
+        proxy_query=torch.empty(0),
+        proxy_weights=torch.empty(0),
+        actual_num_regions=1,
+        step_metadata=step4_sparse_attention.Step4DSAStepMetadata(),
+        use_mtp_union_exact_mask=use_mtp_union_exact_mask,
+    )
+
+    assert paths == [expected_path]
 
 
 def test_step4_builder_uses_upstream_prefill_lifecycle(monkeypatch):

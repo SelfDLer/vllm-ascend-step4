@@ -12,16 +12,19 @@ from typing import Any
 __all__ = [
     "batch_decode_logits_wgmma_n",
     "batch_decode_weighted_relu_logits_sum_paged_sm90_steptron_gqa",
+    "build_decode_mtp_union_exact_mask_meta_sm90_gqa",
     "build_grouped_union_sparse_work_queue_gqa",
     "csa_compact_decode_stage_flush_with_slots_prevalidated_sm90_gqa",
     "csa_compact_prefill_update_with_slots_prevalidated_sm90_gqa",
     "cutedsl_topk_selector_decode_meta_sm90_gqa",
     "decode_weighted_relu_logits_sum_paged_mean_warp_sm90_steptron_gqa",
     "merge_dynamic_split_nat_lse_states_sm90_gqa",
+    "merge_mtp_union_exact_mask_nat_lse_states_sm90_gqa",
     "merge_variable_split_nat_lse_states_sm90_gqa",
     "prefill_paged_weighted_relu_logits_sm90_steptron_gqa",
     "prewarm_csa_compact_prefill_update_with_slots_sm90_gqa",
     "prewarm_topk_selector_decode_meta_sm90_gqa",
+    "token_wise_flash_attn_decode_mtp_union_exact_mask_sm90_gqa_func",
     "token_wise_flash_attn_decode_sm90_gqa_func",
     "token_wise_flash_attn_decode_sm90_gqa_plan",
     "token_wise_flash_attn_prefill_union_sm90_gqa_func",
@@ -38,22 +41,31 @@ _SPLITKV = (
     "vllm.models.step4.nvidia.ops.cute_dsl."
     "sparse_gqa.token_sparse_attn.splitkv_merge_sm90_gqa"
 )
+_MTP_META = (
+    "vllm.models.step4.nvidia.ops.cute_dsl."
+    "sparse_gqa.token_sparse_attn.decode_mtp_union_exact_mask_meta_sm90_gqa"
+)
 
 _TOKEN_EXPORTS = {
+    "token_wise_flash_attn_decode_mtp_union_exact_mask_sm90_gqa_func",
     "token_wise_flash_attn_decode_sm90_gqa_func",
     "token_wise_flash_attn_decode_sm90_gqa_plan",
     "token_wise_flash_attn_prefill_union_sm90_gqa_func",
 }
 _SPLITKV_EXPORTS = {
     "merge_dynamic_split_nat_lse_states_sm90_gqa",
+    "merge_mtp_union_exact_mask_nat_lse_states_sm90_gqa",
     "merge_variable_split_nat_lse_states_sm90_gqa",
 }
+_MTP_META_EXPORTS = {"build_decode_mtp_union_exact_mask_meta_sm90_gqa"}
 _EXPORTS = {
     name: (
         _TOKEN_INTERFACE
         if name in _TOKEN_EXPORTS
         else _SPLITKV
         if name in _SPLITKV_EXPORTS
+        else _MTP_META
+        if name in _MTP_META_EXPORTS
         else _INDEXER_INTERFACE,
         name,
     )

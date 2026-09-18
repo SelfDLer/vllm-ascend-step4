@@ -22,6 +22,7 @@ class Step4KernelPlan:
     num_decode_tokens: int
     has_q1_decode: bool
     has_verifier: bool
+    all_decode_q4_or_padding: bool
     use_flattened_decode: bool
 
 
@@ -51,7 +52,14 @@ def build_step4_kernel_plan(
     if bool((query_lens < 0).any()) or int(starts[-1]) > metadata.num_actual_tokens:
         raise ValueError("Step4 query boundaries exceed the flattened token range")
     if num_reqs == 0:
-        return Step4KernelPlan(0, 0, False, False, False)
+        return Step4KernelPlan(
+            num_decode_requests=0,
+            num_decode_tokens=0,
+            has_q1_decode=False,
+            has_verifier=False,
+            all_decode_q4_or_padding=False,
+            use_flattened_decode=False,
+        )
 
     num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
         metadata,
@@ -74,6 +82,7 @@ def build_step4_kernel_plan(
         num_decode_tokens=num_decode_tokens,
         has_q1_decode=bool((decode_lens == 1).any()),
         has_verifier=has_verifier,
+        all_decode_q4_or_padding=bool(((decode_lens == 4) | (decode_lens == 0)).all()),
         use_flattened_decode=(
             num_decode_tokens > 0 and not bool((query_lens[num_decodes:] > 0).any())
         ),

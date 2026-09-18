@@ -55,6 +55,18 @@ def test_graph_token_capacity_does_not_change_decode_dispatch():
     assert _plan([1, 1], [False, False], padded_tokens=6).use_flattened_decode
 
 
+def test_plan_tracks_q4_rows_independent_of_padded_graph_capacity():
+    q4_plan = _plan([4, 4, 0, 0], [False] * 4, padded_tokens=8)
+    assert q4_plan.num_decode_tokens == 16
+    assert q4_plan.all_decode_q4_or_padding
+
+    # A padded token capacity can satisfy 4 * num_reqs even when live rows are q3.
+    q3_plan = _plan([3, 3, 0, 0], [False] * 4, padded_tokens=10)
+    assert q3_plan.num_decode_tokens == 16
+    assert q3_plan.has_verifier
+    assert not q3_plan.all_decode_q4_or_padding
+
+
 def test_interleaved_verifier_is_rejected_before_summary_mutation():
     with pytest.raises(ValueError, match="must precede"):
         _plan([4, 4], [True, False])

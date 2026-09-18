@@ -28,16 +28,19 @@ from vllm.models.step4.nvidia.ops.cute_dsl.sparse_gqa import (
     batch_decode_weighted_relu_logits_sum_paged_sm90_steptron_gqa as batch_logits,
 )
 from vllm.models.step4.nvidia.ops.cute_dsl.sparse_gqa import (
+    build_decode_mtp_union_exact_mask_meta_sm90_gqa,
     build_grouped_union_sparse_work_queue_gqa,
     csa_compact_decode_stage_flush_with_slots_prevalidated_sm90_gqa,
     csa_compact_prefill_update_with_slots_prevalidated_sm90_gqa,
     cutedsl_topk_selector_decode_meta_sm90_gqa,
     decode_weighted_relu_logits_sum_paged_mean_warp_sm90_steptron_gqa,
     merge_dynamic_split_nat_lse_states_sm90_gqa,
+    merge_mtp_union_exact_mask_nat_lse_states_sm90_gqa,
     merge_variable_split_nat_lse_states_sm90_gqa,
     prefill_paged_weighted_relu_logits_sm90_steptron_gqa,
     prewarm_csa_compact_prefill_update_with_slots_sm90_gqa,
     prewarm_topk_selector_decode_meta_sm90_gqa,
+    token_wise_flash_attn_decode_mtp_union_exact_mask_sm90_gqa_func,
     token_wise_flash_attn_decode_sm90_gqa_func,
     token_wise_flash_attn_decode_sm90_gqa_plan,
     token_wise_flash_attn_prefill_union_sm90_gqa_func,
@@ -224,6 +227,8 @@ _PREFILL_Q_TILE_CAPACITY = 2048
 _BATCH_DECODE_Q_HEADS_PER_KV = 4
 _BATCH_DECODE_Q_RUNTIME_ROWS = 16
 _BATCH_DECODE_BLOCK_Q = 32
+_MTP_UNION_Q_GROUP = 4
+_MTP_UNION_SPLITS = 8
 
 
 _PREFILL_TILE_REQUEST_META_DYNAMIC_ARGS = (
@@ -1986,6 +1991,109 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                 device=device,
                 dtype=torch.float32,
             )
+        if self._supports_mtp_union_exact_mask():
+            mtp_union_rows = max_decode_batch * _MTP_UNION_Q_GROUP
+            mtp_union_work = max_decode_batch * _MTP_UNION_SPLITS
+            mtp_union_full_width = _MTP_UNION_Q_GROUP * (topk + 1)
+            mtp_union_split_width = triton.cdiv(mtp_union_full_width, _MTP_UNION_SPLITS)
+            for name in (
+                "decode_mtp_union_unpacked_logical",
+                "decode_mtp_union_unpacked_phys",
+            ):
+                self._get_dsa_tensor_buffer_at_least(
+                    name,
+                    (mtp_union_rows, topk + 1),
+                    device=device,
+                    dtype=torch.int32,
+                )
+            self._get_dsa_tensor_buffer_at_least(
+                "decode_mtp_union_bitset",
+                (max_decode_batch, triton.cdiv(padded_regions, 32)),
+                device=device,
+                dtype=torch.int32,
+            )
+            for name in (
+                "decode_mtp_union_full_out_req_idx",
+                "decode_mtp_union_full_work_q_global",
+                "decode_mtp_union_full_work_q_local",
+                "decode_mtp_union_full_work_q_len",
+                "decode_mtp_union_full_counts",
+            ):
+                self._get_dsa_tensor_buffer_at_least(
+                    name,
+                    (max_decode_batch,),
+                    device=device,
+                    dtype=torch.int32,
+                )
+            for name in (
+                "decode_mtp_union_full_phys",
+                "decode_mtp_union_full_logical",
+                "decode_mtp_union_full_exact_mask",
+            ):
+                self._get_dsa_tensor_buffer_at_least(
+                    name,
+                    (max_decode_batch, mtp_union_full_width),
+                    device=device,
+                    dtype=torch.int32,
+                )
+            self._get_dsa_tensor_buffer_at_least(
+                "decode_mtp_union_full_causal_limits",
+                (max_decode_batch, _MTP_UNION_Q_GROUP),
+                device=device,
+                dtype=torch.int32,
+            )
+            for name in (
+                "decode_mtp_union_split_counts",
+                "decode_mtp_union_work_q_global",
+                "decode_mtp_union_work_q_input_local",
+                "decode_mtp_union_work_q_output_base",
+                "decode_mtp_union_work_q_len",
+            ):
+                self._get_dsa_tensor_buffer_at_least(
+                    name,
+                    (mtp_union_work,),
+                    device=device,
+                    dtype=torch.int32,
+                )
+            for name in (
+                "decode_mtp_union_split_phys",
+                "decode_mtp_union_split_logical",
+                "decode_mtp_union_split_exact_mask",
+            ):
+                self._get_dsa_tensor_buffer_at_least(
+                    name,
+                    (mtp_union_work, mtp_union_split_width),
+                    device=device,
+                    dtype=torch.int32,
+                )
+            self._get_dsa_tensor_buffer_at_least(
+                "decode_mtp_union_causal_limits",
+                (mtp_union_work, _MTP_UNION_Q_GROUP),
+                device=device,
+                dtype=torch.int32,
+            )
+            self._get_dsa_tensor_buffer_at_least(
+                "decode_mtp_union_partial_out",
+                (
+                    mtp_union_rows * _MTP_UNION_SPLITS,
+                    self.num_heads,
+                    self.head_size,
+                ),
+                device=device,
+                dtype=self._decode_out_dtype or torch.bfloat16,
+            )
+            self._get_dsa_tensor_buffer_at_least(
+                "decode_mtp_union_partial_lse",
+                (mtp_union_rows * _MTP_UNION_SPLITS, self.num_heads),
+                device=device,
+                dtype=torch.float32,
+            )
+            self._get_dsa_tensor_buffer_at_least(
+                "decode_mtp_union_merged_lse",
+                (mtp_union_rows, self.num_heads),
+                device=device,
+                dtype=torch.float32,
+            )
         self._get_dsa_tensor_buffer_at_least(
             "decode_kernel_block_table",
             (max_decode_rows, (num_regions + 1) // 2),
@@ -2537,6 +2645,24 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                 f"max_seq_len={max_seq_len}, capacity={capacity}."
             )
 
+    def _supports_mtp_union_exact_mask(self) -> bool:
+        mtp = getattr(self, "_mtp", None)
+        return bool(
+            mtp is not None
+            and int(mtp.num_speculative_tokens) == 3
+            and int(getattr(self, "num_heads", 0)) == 16
+            and int(getattr(self, "num_kv_heads", 0)) == 1
+        )
+
+    def _uses_mtp_union_exact_mask(self, plan: Step4KernelPlan) -> bool:
+        """Return whether this decode prefix is uniformly grouped as q4."""
+        return bool(
+            self._supports_mtp_union_exact_mask()
+            and plan.num_decode_requests > 0
+            and plan.has_verifier
+            and plan.all_decode_q4_or_padding
+        )
+
     def _forward_sparse_gqa_cutedsl(
         self,
         *,
@@ -2554,6 +2680,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         num_reqs = int(getattr(attn_metadata, "num_actual_reqs", metadata_num_reqs))
         num_actual_tokens = int(getattr(attn_metadata, "num_actual_tokens", 0))
         plan: Step4KernelPlan = cast(Any, attn_metadata).step4_kernel_plan
+        use_mtp_union_exact_mask = self._uses_mtp_union_exact_mask(plan)
         valid_requests = getattr(attn_metadata, "dsa_valid_requests", None)
         valid_tokens = getattr(attn_metadata, "dsa_valid_tokens", None)
         if _step4_dsa_is_cuda_graph_capturing() and (
@@ -2621,6 +2748,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                     step_metadata=step_metadata,
                     valid_requests=valid_requests,
                     valid_tokens=valid_tokens,
+                    use_mtp_union_exact_mask=use_mtp_union_exact_mask,
                 )
 
         num_decode_reqs = plan.num_decode_requests
@@ -2665,6 +2793,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                     step_metadata=step_metadata,
                     valid_requests=valid_requests,
                     valid_tokens=valid_tokens,
+                    use_mtp_union_exact_mask=use_mtp_union_exact_mask,
                 )
 
         num_prefill_reqs = num_reqs - num_decode_reqs
@@ -3077,6 +3206,7 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         step_metadata: Step4DSAStepMetadata,
         valid_requests: torch.Tensor | None = None,
         valid_tokens: torch.Tensor | None = None,
+        use_mtp_union_exact_mask: bool = False,
     ) -> torch.Tensor:
         num_reqs = int(query.shape[0])
         if num_reqs <= 0:
@@ -3103,7 +3233,21 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
         output_view = output.view(-1, self.num_heads, self.head_size)
         attn_out = output_view[:num_reqs]
         with torch.profiler.record_function("step4_dsa.decode.attn_kernel"):
-            if self.sparse_decode_split_max == 1:
+            if use_mtp_union_exact_mask and num_reqs % _MTP_UNION_Q_GROUP == 0:
+                self._sparse_gqa_decode_attn_mtp_union_exact_mask(
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    region_counts=region_counts,
+                    region_packed_indices=region_packed_indices,
+                    seq_lens=seq_lens,
+                    attn_out=attn_out,
+                    num_reqs=num_reqs,
+                    num_region_bins=self._sparse_gqa_region_bucket(
+                        int(actual_num_regions)
+                    ),
+                )
+            elif self.sparse_decode_split_max == 1:
                 token_wise_flash_attn_decode_sm90_gqa_func(
                     query,
                     key_cache,
@@ -3131,6 +3275,168 @@ class Step4DSAAttentionImpl(Step4SplitKVFlashAttentionImpl):
                     valid_tokens=valid_tokens,
                 )
         return output
+
+    def _sparse_gqa_decode_attn_mtp_union_exact_mask(
+        self,
+        *,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        region_counts: torch.Tensor,
+        region_packed_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_out: torch.Tensor,
+        num_reqs: int,
+        num_region_bins: int,
+    ) -> None:
+        device = query.device
+        requests = int(num_reqs) // _MTP_UNION_Q_GROUP
+        work_count = requests * _MTP_UNION_SPLITS
+        topk_windows = int(region_packed_indices.shape[1])
+        full_union_width = _MTP_UNION_Q_GROUP * topk_windows
+        split_union_width = triton.cdiv(full_union_width, _MTP_UNION_SPLITS)
+
+        def int32_buffer(name: str, shape: tuple[int, ...]) -> torch.Tensor:
+            return self._get_dsa_tensor_buffer_at_least(
+                name, shape, device=device, dtype=torch.int32
+            )
+
+        unpacked_logical = int32_buffer(
+            "decode_mtp_union_unpacked_logical", (num_reqs, topk_windows)
+        )
+        unpacked_phys = int32_buffer(
+            "decode_mtp_union_unpacked_phys", (num_reqs, topk_windows)
+        )
+        bitset = int32_buffer(
+            "decode_mtp_union_bitset",
+            (requests, triton.cdiv(num_region_bins, 32)),
+        )
+        full_out_req_idx = int32_buffer(
+            "decode_mtp_union_full_out_req_idx", (requests,)
+        )
+        full_work_q_global = int32_buffer(
+            "decode_mtp_union_full_work_q_global", (requests,)
+        )
+        full_work_q_local = int32_buffer(
+            "decode_mtp_union_full_work_q_local", (requests,)
+        )
+        full_work_q_len = int32_buffer("decode_mtp_union_full_work_q_len", (requests,))
+        full_union_counts = int32_buffer("decode_mtp_union_full_counts", (requests,))
+        full_union_phys = int32_buffer(
+            "decode_mtp_union_full_phys", (requests, full_union_width)
+        )
+        full_union_logical = int32_buffer(
+            "decode_mtp_union_full_logical", (requests, full_union_width)
+        )
+        full_causal_limits = int32_buffer(
+            "decode_mtp_union_full_causal_limits",
+            (requests, _MTP_UNION_Q_GROUP),
+        )
+        full_exact_mask = int32_buffer(
+            "decode_mtp_union_full_exact_mask", (requests, full_union_width)
+        )
+        split_union_counts = int32_buffer(
+            "decode_mtp_union_split_counts", (work_count,)
+        )
+        split_union_phys = int32_buffer(
+            "decode_mtp_union_split_phys", (work_count, split_union_width)
+        )
+        split_union_logical = int32_buffer(
+            "decode_mtp_union_split_logical", (work_count, split_union_width)
+        )
+        split_exact_mask = int32_buffer(
+            "decode_mtp_union_split_exact_mask", (work_count, split_union_width)
+        )
+        work_q_global = int32_buffer("decode_mtp_union_work_q_global", (work_count,))
+        work_q_input_local = int32_buffer(
+            "decode_mtp_union_work_q_input_local", (work_count,)
+        )
+        work_q_output_base = int32_buffer(
+            "decode_mtp_union_work_q_output_base", (work_count,)
+        )
+        work_q_len = int32_buffer("decode_mtp_union_work_q_len", (work_count,))
+        causal_limits = int32_buffer(
+            "decode_mtp_union_causal_limits",
+            (work_count, _MTP_UNION_Q_GROUP),
+        )
+        partial_out = self._get_dsa_tensor_buffer_at_least(
+            "decode_mtp_union_partial_out",
+            (num_reqs * _MTP_UNION_SPLITS, self.num_heads, self.head_size),
+            device=device,
+            dtype=query.dtype,
+        )
+        partial_lse = self._get_dsa_tensor_buffer_at_least(
+            "decode_mtp_union_partial_lse",
+            (num_reqs * _MTP_UNION_SPLITS, self.num_heads),
+            device=device,
+            dtype=torch.float32,
+        )
+        merged_lse = self._get_dsa_tensor_buffer_at_least(
+            "decode_mtp_union_merged_lse",
+            (num_reqs, self.num_heads),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        with torch.profiler.record_function(
+            "step4_dsa.decode.mtp_union_exact_mask_meta"
+        ):
+            build_decode_mtp_union_exact_mask_meta_sm90_gqa(
+                region_counts=region_counts,
+                region_packed_indices=region_packed_indices,
+                kv_seq_lens=seq_lens,
+                unpacked_logical=unpacked_logical,
+                unpacked_phys=unpacked_phys,
+                bitset=bitset,
+                full_out_req_idx=full_out_req_idx,
+                full_work_q_global=full_work_q_global,
+                full_work_q_local=full_work_q_local,
+                full_work_q_len=full_work_q_len,
+                full_union_counts=full_union_counts,
+                full_union_phys=full_union_phys,
+                full_union_logical=full_union_logical,
+                full_causal_limits=full_causal_limits,
+                full_exact_mask=full_exact_mask,
+                split_union_counts=split_union_counts,
+                split_union_phys=split_union_phys,
+                split_union_logical=split_union_logical,
+                split_exact_mask=split_exact_mask,
+                work_q_global=work_q_global,
+                work_q_input_local=work_q_input_local,
+                work_q_output_base=work_q_output_base,
+                work_q_len=work_q_len,
+                causal_limits=causal_limits,
+                num_region_bins=int(num_region_bins),
+            )
+        with torch.profiler.record_function(
+            "step4_dsa.decode.mtp_union_exact_mask_attn"
+        ):
+            token_wise_flash_attn_decode_mtp_union_exact_mask_sm90_gqa_func(
+                query,
+                key_cache,
+                value_cache,
+                union_counts=split_union_counts,
+                union_phys_indices=split_union_phys,
+                union_logical_indices=split_union_logical,
+                exact_mask_bits=split_exact_mask,
+                work_q_global=work_q_global,
+                work_q_input_local=work_q_input_local,
+                work_q_output_base=work_q_output_base,
+                work_q_len=work_q_len,
+                causal_limits=causal_limits,
+                partial_out=partial_out,
+                partial_lse=partial_lse,
+                softmax_scale=float(self.scale),
+            )
+        with torch.profiler.record_function(
+            "step4_dsa.decode.mtp_union_exact_mask_merge"
+        ):
+            merge_mtp_union_exact_mask_nat_lse_states_sm90_gqa(
+                partial_out,
+                partial_lse,
+                attn_out,
+                merged_lse,
+            )
 
     def _sparse_gqa_decode_attn_split_kv(
         self,
