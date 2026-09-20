@@ -1,5 +1,8 @@
+# Copyright (c) 2025, Tri Dao.
 # Copyright (c) 2026 StepFun Team. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Portions derived from Dao-AILab/flash-attention
+# @0256114fe2381ab293503219bdd9078de3cd26b3, flash_attn/cute/ampere_helpers.py
 
 from typing import Callable, Optional
 

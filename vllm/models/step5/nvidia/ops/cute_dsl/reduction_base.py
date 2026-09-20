@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# SPDX-License-Identifier: Apache-2.0
+# Source: Dao-AILab/quack@2d98b796a3e04e31c433b5fc40daf14954c4da09,
+# quack/reduction_base.py
 
 import torch
 from typing import Type, Tuple, Optional

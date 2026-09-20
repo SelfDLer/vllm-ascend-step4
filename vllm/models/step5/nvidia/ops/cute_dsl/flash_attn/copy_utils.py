@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# SPDX-License-Identifier: BSD-3-Clause
+# Source: Dao-AILab/flash-attention@0256114fe2381ab293503219bdd9078de3cd26b3,
+# flash_attn/cute/copy_utils.py
 
 import math
 from typing import Optional, Type, Tuple, Callable

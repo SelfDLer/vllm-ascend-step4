@@ -463,7 +463,7 @@ def _to_cute_tensor_for_optimus_runtime(tensor: Any):
 
 
 def patch_cutlass_tensor_adapter() -> bool:
-    """Route torch.Tensor adapter through Optimus' version-aware tensor conversion."""
+    """Route torch.Tensor through the version-aware tensor conversion."""
     try:
         import torch
         from cutlass.cute.runtime import TensorAdapter
@@ -502,7 +502,7 @@ def patch_cutlass_tensor_adapter() -> bool:
 
 
 def patch_tvm_ffi_args_spec_converter() -> bool:
-    """Handle Optimus tensor and compile-time aggregate arguments in TVM FFI."""
+    """Handle tensor and compile-time aggregate arguments in TVM FFI."""
     try:
         import torch
         from cutlass.cute import _tvm_ffi_args_spec_converter as args_converter  # type: ignore

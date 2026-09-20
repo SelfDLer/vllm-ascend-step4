@@ -6,8 +6,9 @@ include requirements/cpu.txt
 include CMakeLists.txt
 include rust-toolchain.toml
 include tools/build_rust.py
-include OPTIMUS_JIT_VENDOR_NOTICE.md
-include OPTIMUS_JIT_VENDOR_MANIFEST.tsv
+include THIRD_PARTY_NOTICES.md
+include THIRD_PARTY_LICENSES/flash-attention-BSD-3-Clause.txt
+include THIRD_PARTY_LICENSES/flash-attention-AUTHORS
 
 recursive-include cmake *
 recursive-include csrc *

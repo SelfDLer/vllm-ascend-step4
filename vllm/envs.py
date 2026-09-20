@@ -1950,7 +1950,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
-    # Step5 Optimus custom-op tier.
+    # Step5 custom-op tier.
     "VLLM_STEP_CC_LEVEL": lambda: int(os.getenv("VLLM_STEP_CC_LEVEL", "0")),
     "VLLM_STEP5_DSA_INDEX_TP_SIZE": lambda: int(
         os.getenv("VLLM_STEP5_DSA_INDEX_TP_SIZE", "4")

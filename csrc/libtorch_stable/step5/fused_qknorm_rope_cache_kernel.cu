@@ -55,7 +55,7 @@ __global__ void optimus_qknorm_rope_cache_kernel(
     using Rope = typename RopeConverter::hip_type;
 
     // BITWISE uses the exact per-head layouts from
-    // optimus_cutedsl.fused_qknorm_rope_forward_impl. The fast path keeps the
+    // the Step5 CuTeDSL reference implementation. The fast path keeps the
     // same number of threads, but uses a strided, coalesced register layout so
     // each lane owns both halves of every NeoX rotary pair.
     static_assert(!WIDE_192_ROTARY || HEAD_DIM == 192);

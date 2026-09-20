@@ -176,7 +176,7 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_optimus_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable the Step5 Optimus residual-add fusion at CC level 1+."""
+    """Enable the Step5 residual-add/RMSNorm fusion at CC level 1+."""
     from vllm.platforms import current_platform
 
     model_config = cfg.model_config

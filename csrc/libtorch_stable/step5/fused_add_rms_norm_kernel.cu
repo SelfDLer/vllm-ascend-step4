@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Step5 bitwise fused residual-add + Optimus-compatible RMSNorm kernel.
+// Step5 bitwise fused residual-add and RMSNorm kernel.
 
 // This kernel is built into `_C_stable_libtorch` and uses the libtorch stable
 // ABI (torch::stable::Tensor / STD_TORCH_CHECK) instead of ATen and c10.
@@ -56,7 +56,7 @@ template <typename scalar_t>
 __device__ __forceinline__ float round_to_scalar_type(const float value) {
   using Converter = _typeConvert<scalar_t>;
   // This explicit downcast/upcast is required for bitwise equivalence with
-  // the unfused aten.add -> Optimus RMSNorm graph. aten.add materializes the
+  // the unfused aten.add -> RMSNorm graph. aten.add materializes the
   // activation-typed residual tensor before RMSNorm reads it.
   return Converter::convert(Converter::convert(value));
 }
@@ -122,7 +122,7 @@ __global__ void optimus_fused_add_rms_norm_kernel(
     // The residual output and the RMSNorm input must be the exact same
     // activation-typed value. Without this explicit round-trip, RMSNorm would
     // consume the pre-rounding FP32 registers and would not be bitwise with
-    // the original aten.add -> Optimus RMSNorm sequence.
+    // the original aten.add -> RMSNorm sequence.
     values[i] = round_to_scalar_type<scalar_t>(values[i]);
     store_vector<scalar_t>(residual_out + vector_offset, values[i]);
     sum += values[i].x * values[i].x + values[i].y * values[i].y +
@@ -398,7 +398,7 @@ void optimus_fused_add_rms_norm(torch::stable::Tensor& output,
         hidden_size / 1024 == 10 || hidden_size / 1024 == 12 ||
         hidden_size / 1024 == 16));
   STD_TORCH_CHECK(supported_hidden_size,
-                  "Optimus fused RMSNorm does not support hidden size ",
+                  "Step5 fused RMSNorm does not support hidden size ",
                   hidden_size);
 
   if (input.numel() == 0) {

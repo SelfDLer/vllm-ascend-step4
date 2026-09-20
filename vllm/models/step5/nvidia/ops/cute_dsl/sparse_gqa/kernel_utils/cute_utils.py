@@ -1,5 +1,10 @@
+# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 # Copyright (c) 2026 StepFun Team. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Portions derived from Dao-AILab/flash-attention
+# @0256114fe2381ab293503219bdd9078de3cd26b3,
+# flash_attn/cute/{utils.py,copy_utils.py}, and Dao-AILab/quack
+# @2d98b796a3e04e31c433b5fc40daf14954c4da09, quack/utils.py
 
 from typing import Optional
 

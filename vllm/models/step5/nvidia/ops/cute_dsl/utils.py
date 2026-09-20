@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# SPDX-License-Identifier: Apache-2.0
+# Source: Dao-AILab/quack@ec2980f20df49b7eb1190123eabbaa414713e35f,
+# quack/utils.py
 
 import operator
 import inspect

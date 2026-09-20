@@ -240,7 +240,7 @@ def topk_selector_decode_meta_capacity_class_sm90_gqa(
 ) -> Optional[int]:
     """Return the single-CTA shared-memory artifact class for a score capacity.
 
-    ``None`` denotes the streaming path. The threshold remains an Optimus
+    ``None`` denotes the streaming path. The threshold remains a kernel
     implementation detail so callers do not need to mirror its dispatch rule.
     """
     score_capacity = int(score_capacity)

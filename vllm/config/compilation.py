@@ -121,7 +121,7 @@ class PassConfig:
     fuse_norm_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom RMSNorm + quant ops."""
     fuse_optimus_rms: bool = None  # type: ignore[assignment]
-    """Fuse residual add + zero-centered Optimus RMSNorm."""
+    """Fuse Step5 residual add + zero-centered RMSNorm."""
     fuse_act_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom SiluMul + quant ops."""
     fuse_attn_quant: bool = None  # type: ignore[assignment]
@@ -283,7 +283,7 @@ class PassConfig:
             self.enable_qk_norm_rope_fusion = False
         if self.fuse_optimus_rms and not current_platform.is_cuda():
             logger.warning_once(
-                "Optimus RMSNorm fusion requires CUDA. The fusion will be disabled."
+                "Step5 RMSNorm fusion requires CUDA. The fusion will be disabled."
             )
             self.fuse_optimus_rms = False
         if self.fuse_act_padding and not current_platform.is_rocm():

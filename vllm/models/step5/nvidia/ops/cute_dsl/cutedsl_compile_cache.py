@@ -1,4 +1,4 @@
-"""Persistent AOT cache for Optimus CuTeDSL compiled kernels."""
+"""Persistent AOT cache for Step5 CuTeDSL compiled kernels."""
 
 from __future__ import annotations
 
@@ -274,7 +274,7 @@ class CutedslAotCache(CutedslJitCache):
             raise RuntimeError(
                 "Refusing to load a CuTeDSL AOT artifact without a v2 compatibility "
                 f"manifest: {self._cache_path / f'{digest}.so'}. The cache entry is "
-                "legacy or incomplete and must be rebuilt by the current Optimus JIT."
+                "legacy or incomplete and must be rebuilt by the current Step5 JIT."
             )
         try:
             with open(manifest_path, encoding="utf-8") as f:
