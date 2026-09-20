@@ -89,21 +89,21 @@ def test_customized_tokenizer():
 @pytest.mark.parametrize(
     ("config", "model_type_hint"),
     [
-        (SimpleNamespace(model_type="step4"), None),
+        (SimpleNamespace(model_type="step5"), None),
         (
             SimpleNamespace(
                 model_type="composite_wrapper",
-                text_config=SimpleNamespace(model_type="step4"),
+                text_config=SimpleNamespace(model_type="step5"),
             ),
             None,
         ),
-        (None, "step4"),
-        (SimpleNamespace(model_type="step4"), "unrelated_owner"),
-        (SimpleNamespace(model_type="step4_mtp"), None),
-        (None, "step4_mtp"),
+        (None, "step5"),
+        (SimpleNamespace(model_type="step5"), "unrelated_owner"),
+        (SimpleNamespace(model_type="step5_mtp"), None),
+        (None, "step5_mtp"),
     ],
 )
-def test_step4_uses_generic_fast_tokenizer_backend(config, model_type_hint):
+def test_step5_uses_generic_fast_tokenizer_backend(config, model_type_hint):
     tokenizer = SimpleNamespace(is_fast=True)
 
     with (
@@ -127,17 +127,17 @@ def test_step4_uses_generic_fast_tokenizer_backend(config, model_type_hint):
     ):
         assert (
             get_tokenizer(
-                "step4-test-model",
+                "step5-test-model",
                 tokenizer_mode="hf",
                 model_type_hint=model_type_hint,
             )
             is tokenizer
         )
 
-    assert from_pretrained.call_args.args == ("step4-test-model",)
+    assert from_pretrained.call_args.args == ("step5-test-model",)
     assert from_pretrained.call_args.kwargs["truncation_side"] == "left"
     assert "config" not in from_pretrained.call_args.kwargs
-    if model_type_hint in {"step4", "step4_mtp"}:
+    if model_type_hint in {"step5", "step5_mtp"}:
         get_config_mock.assert_not_called()
     else:
         get_config_mock.assert_called_once()
@@ -146,9 +146,9 @@ def test_step4_uses_generic_fast_tokenizer_backend(config, model_type_hint):
 @pytest.mark.parametrize(
     ("top_level_model_type", "text_model_type", "expected_hint"),
     [
-        ("step4", "step4", "step4"),
-        ("composite_wrapper", "step4", "step4"),
-        ("step3_vl", "step4", "step3_vl"),
+        ("step5", "step5", "step5"),
+        ("composite_wrapper", "step5", "step5"),
+        ("step3_vl", "step5", "step3_vl"),
         ("qwen3_vl", "qwen3", "qwen3_vl"),
     ],
 )

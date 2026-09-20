@@ -16,4 +16,4 @@ include rust/.gitattributes
 include rust/.gitignore
 recursive-include rust/.config *
 prune rust/target
-recursive-include vllm/models/step4/nvidia/ops/triton *.cpp
+recursive-include vllm/models/step5/nvidia/ops/triton *.cpp

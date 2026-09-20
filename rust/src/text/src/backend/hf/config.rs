@@ -192,7 +192,7 @@ impl ModelConfig {
 
     /// Return whether this model uses a padded checkpoint vocabulary.
     pub(super) fn supports_valid_vocab_size(&self) -> bool {
-        matches!(self.model_type(), Some("step4" | "step4_mtp"))
+        matches!(self.model_type(), Some("step5" | "step5_mtp"))
     }
 
     /// Return the effective model vocabulary size, following the same
@@ -347,7 +347,7 @@ mod tests {
                 "eos_token_id": 2,
                 "num_experts": 64,
                 "text_config": {
-                    "model_type": "step4",
+                    "model_type": "step5",
                     "vocab_size": 128896,
                     "eos_token_id": [128815, 128816],
                     "num_local_experts": 8
@@ -357,7 +357,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.num_experts(), 8);
-        assert_eq!(config.model_type(), Some("step4"));
+        assert_eq!(config.model_type(), Some("step5"));
         assert_eq!(config.top_level_model_type(), Some("top_level"));
         assert_eq!(config.vocab_size().unwrap(), 128896);
         assert_eq!(config.eos_token_ids(), &[128815, 128816]);

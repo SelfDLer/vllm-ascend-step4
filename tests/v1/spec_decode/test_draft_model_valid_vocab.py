@@ -14,7 +14,7 @@ def test_heterogeneous_vocab_mapping_uses_effective_vocab_sizes(monkeypatch):
     target_model_config = SimpleNamespace(
         tokenizer="target-tokenizer",
         trust_remote_code=False,
-        hf_config=SimpleNamespace(model_type="step4"),
+        hf_config=SimpleNamespace(model_type="step5"),
         get_valid_vocab_size=Mock(return_value=128815),
         get_vocab_size=Mock(side_effect=AssertionError("checkpoint vocab used")),
     )

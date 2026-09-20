@@ -176,14 +176,14 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_optimus_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable the Step4 Optimus residual-add fusion at CC level 1+."""
+    """Enable the Step5 Optimus residual-add fusion at CC level 1+."""
     from vllm.platforms import current_platform
 
     model_config = cfg.model_config
     return (
         model_config is not None
         and model_config.architecture
-        in {"Step4ForCausalLM", "Step4ForConditionalGeneration", "Step4MTP"}
+        in {"Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"}
         and current_platform.is_cuda()
         and envs.VLLM_STEP_CC_LEVEL >= 1
     )
@@ -2309,13 +2309,13 @@ class VllmConfig:
             unsupported.append("routed experts capture")
 
         if model_config is not None and model_config.architecture in {
-            "Step4ForCausalLM",
-            "Step4ForConditionalGeneration",
-            "Step4MTP",
+            "Step5ForCausalLM",
+            "Step5ForConditionalGeneration",
+            "Step5MTP",
         }:
-            # Keep Step4 fail-closed until its DSA, side-storage, and MTP
+            # Keep Step5 fail-closed until its DSA, side-storage, and MTP
             # paths have dedicated V2 runner coverage.
-            unsupported.append("Step4 models")
+            unsupported.append("Step5 models")
 
         has_logitsproc_plugins = False
         if model_config is not None:

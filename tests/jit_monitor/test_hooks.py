@@ -297,7 +297,7 @@ def test_cutedsl_error_mode_raises():
 
 
 def test_cutedsl_subscripted_compile_is_monitored():
-    """Step4-style ``cute.compile[options](...)`` keeps options and is monitored."""
+    """Step5-style ``cute.compile[options](...)`` keeps options and is monitored."""
 
     calls = []
 
@@ -312,7 +312,7 @@ def test_cutedsl_subscripted_compile_is_monitored():
             calls.append((self.options, args, kwargs))
             return "compiled"
 
-    def step4_kernel():
+    def step5_kernel():
         return None
 
     options = ("opt_level", 3)
@@ -321,13 +321,13 @@ def test_cutedsl_subscripted_compile_is_monitored():
 
         jit_monitor.activate()
         with mock.patch.object(jit_monitor.logger, "warning_once") as warning_once:
-            result = cute.compile[options](step4_kernel, "arg", dynamic=True)
+            result = cute.compile[options](step5_kernel, "arg", dynamic=True)
 
     assert result == "compiled"
-    assert calls == [(options, (step4_kernel, "arg"), {"dynamic": True})]
+    assert calls == [(options, (step5_kernel, "arg"), {"dynamic": True})]
     warning_once.assert_called_once()
     msg = warning_once.call_args[0][0] % warning_once.call_args[0][1:]
-    assert "step4_kernel" in msg
+    assert "step5_kernel" in msg
 
 
 # ------------------------------------------------------------------

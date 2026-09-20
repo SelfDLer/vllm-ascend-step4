@@ -1266,9 +1266,9 @@ class ModelConfig:
 
     def supports_valid_vocab_size(self) -> bool:
         return self.architecture in {
-            "Step4ForCausalLM",
-            "Step4ForConditionalGeneration",
-            "Step4MTP",
+            "Step5ForCausalLM",
+            "Step5ForConditionalGeneration",
+            "Step5MTP",
         }
 
     def requires_valid_vocab_size_resolution(self) -> bool:
@@ -1279,14 +1279,14 @@ class ModelConfig:
         if valid_vocab_size is None:
             if self.requires_valid_vocab_size_resolution() and self.skip_tokenizer_init:
                 raise ValueError(
-                    "Step4 with skip_tokenizer_init requires an explicit "
+                    "Step5 with skip_tokenizer_init requires an explicit "
                     "valid_vocab_size because the checkpoint vocabulary is "
                     "padded."
                 )
             return
         if not self.supports_valid_vocab_size():
             raise ValueError(
-                "valid_vocab_size is currently supported only for Step4 "
+                "valid_vocab_size is currently supported only for Step5 "
                 f"models, got architecture {self.architecture}."
             )
         vocab_size = self.get_vocab_size()

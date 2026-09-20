@@ -207,8 +207,8 @@ _TEXT_GENERATION_MODELS = {
     "Step1ForCausalLM": ("step1", "Step1ForCausalLM"),
     "Step3TextForCausalLM": ("step3_text", "Step3TextForCausalLM"),
     "Step3p5ForCausalLM": ("step3p5", "Step3p5ForCausalLM"),
-    # Keep the Step4 implementation isolated from upstream's Step3.5 model.
-    "Step4ForCausalLM": ("vllm.models.step4", "Step4ForCausalLM"),
+    # Keep the Step5 implementation isolated from upstream's Step3.5 model.
+    "Step5ForCausalLM": ("vllm.models.step5", "Step5ForCausalLM"),
     "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),
     "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
     "SolarForCausalLM": ("solar", "SolarForCausalLM"),
@@ -591,9 +591,9 @@ _MULTIMODAL_MODELS = {
     "StepVLForConditionalGeneration": ("step_vl", "StepVLForConditionalGeneration"),
     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),
     "Step3p7ForConditionalGeneration": ("step3p7", "Step3p7ForConditionalGeneration"),
-    "Step4ForConditionalGeneration": (
-        "step4_vl",
-        "Step4ForConditionalGeneration",
+    "Step5ForConditionalGeneration": (
+        "step5_vl",
+        "Step5ForConditionalGeneration",
     ),
     "UltravoxModel": ("ultravox", "UltravoxModel"),
     "VoxtralForConditionalGeneration": ("voxtral", "VoxtralForConditionalGeneration"),
@@ -663,7 +663,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
     # Keep Step3.5 speculative decode on its upstream implementation.
-    "Step4MTP": ("vllm.models.step4", "Step4MTP"),
+    "Step5MTP": ("vllm.models.step5", "Step5MTP"),
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),

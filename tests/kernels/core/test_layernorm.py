@@ -265,7 +265,7 @@ def test_gemma_rms_norm_mixed_input_weight_dtype(default_vllm_config) -> None:
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("zero_centered", [False, True])
 @torch.inference_mode()
-def test_step4_optimus_fused_add_rms_norm_matches_reference(
+def test_step5_optimus_fused_add_rms_norm_matches_reference(
     hidden_size: int,
     dtype: torch.dtype,
     weight_dtype: torch.dtype,

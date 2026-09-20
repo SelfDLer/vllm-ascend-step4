@@ -1185,7 +1185,7 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
 
 package_data = {
-    "vllm.models.step4.nvidia.ops.triton.utils": [
+    "vllm.models.step5.nvidia.ops.triton.utils": [
         "_signature.cpp",
     ],
     "vllm": [

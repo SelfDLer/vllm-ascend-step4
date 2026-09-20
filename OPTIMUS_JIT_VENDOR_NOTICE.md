@@ -1,7 +1,7 @@
-# Vendored Component Notice: Step4 Optimus Inference Kernels
+# Vendored Component Notice: Step5 Optimus Inference Kernels
 
 This notice describes provenance, packaging, and release constraints for the
-model-scoped Optimus inference kernel closure used by Step4 on the vLLM
+model-scoped Optimus inference kernel closure used by Step5 on the vLLM
 `v0.27.0` baseline. It is an informational notice only. **It is not a
 copyright license, a sublicense, or an authorization to redistribute any
 file.** Inclusion of this notice in package metadata does not change the
@@ -9,11 +9,11 @@ license of the referenced files.
 
 ## Scope and provenance
 
-Only the Step4 inference closure copied from the internal `optimus_jit`
-repository is vendored. It is owned by the Step4 NVIDIA model integration at:
+Only the Step5 inference closure copied from the internal `optimus_jit`
+repository is vendored. It is owned by the Step5 NVIDIA model integration at:
 
-- `vllm/models/step4/nvidia/ops/cute_dsl/`;
-- `vllm/models/step4/nvidia/ops/triton/`.
+- `vllm/models/step5/nvidia/ops/cute_dsl/`;
+- `vllm/models/step5/nvidia/ops/triton/`.
 
 The source snapshot used for this integration was:
 
@@ -40,12 +40,12 @@ origin. In particular:
 vendored kernel roots. It records the source repository and revision, source
 Git blob and SHA-256 digest, current vendored SHA-256 digest, and whether the
 current file differs from the source snapshot. Model-owned integration files
-such as `vllm/models/step4/nvidia/ops/__init__.py` and its README are not
+such as `vllm/models/step5/nvidia/ops/__init__.py` and its README are not
 represented as Optimus source. The manifest records provenance only; it is not
 a license or redistribution authorization.
 
-The related CUDA integration under `csrc/libtorch_stable/step4/` builds
-Step4-specific native operators into vLLM's stable libtorch extension. The
+The related CUDA integration under `csrc/libtorch_stable/step5/` builds
+Step5-specific native operators into vLLM's stable libtorch extension. The
 model-scoped directory follows the extension's ownership boundary; the
 existing `torch.ops._C.optimus_*` names remain compatibility ABI. Its manifest
 baseline is internal vLLM commit
@@ -60,14 +60,14 @@ and SPDX header are provenance evidence, not authorization by themselves.
 
 ## Model-scoped ownership
 
-The vendored Python kernels are implementation details of the Step4 NVIDIA
+The vendored Python kernels are implementation details of the Step5 NVIDIA
 backend. They are not general top-level Python packages and do not define a
-cross-project Optimus compatibility API. Callers must use the lazy Step4
+cross-project Optimus compatibility API. Callers must use the lazy Step5
 facade/dispatcher so registry and config discovery do not import CuTeDSL leaf
 modules or initialize the CUDA driver.
 
 The standalone `optimus_jit_compile_log.py` hook is not part of this closure.
-Step4 uses vLLM's shared `vllm.utils.jit_monitor` and model-executor warmup
+Step5 uses vLLM's shared `vllm.utils.jit_monitor` and model-executor warmup
 infrastructure instead of installing a second CuTeDSL or Triton monkey patch.
 Do not reintroduce the top-level `optimus_cutedsl`, `optimus_triton`, or
 `optimus_jit_compile_log` modules into release artifacts.
@@ -76,7 +76,7 @@ If the larger Optimus library must be shared by training, vLLM, or other
 serving systems, it should be released as a separately versioned package with
 its own license review, compatibility matrix, build, tests, and provenance
 metadata. Do not expand the model-scoped closure without confirming that the
-new file is required for Step4 inference and recording its origin and license
+new file is required for Step5 inference and recording its origin and license
 status.
 
 ## Current packaging wiring
@@ -84,16 +84,16 @@ status.
 The source tree wires the model-scoped closure through:
 
 - `pyproject.toml`, whose normal `vllm*` package discovery includes the nested
-  Step4 packages without publishing top-level Optimus packages;
+  Step5 packages without publishing top-level Optimus packages;
 - `MANIFEST.in` and `setup.py`, which include the retained Triton signature C++
-  helper under `vllm.models.step4.nvidia.ops.triton.utils`;
+  helper under `vllm.models.step5.nvidia.ops.triton.utils`;
 - `OPTIMUS_JIT_VENDOR_MANIFEST.tsv`, which is included in source and wheel
   license metadata; and
-- `CMakeLists.txt`, which adds `csrc/libtorch_stable/step4/` only to CUDA builds
-  and registers the Step4 operators in `torch.ops._C`.
+- `CMakeLists.txt`, which adds `csrc/libtorch_stable/step5/` only to CUDA builds
+  and registers the Step5 operators in `torch.ops._C`.
 
 The inference-only Triton closure intentionally omits the old tensor-data-swap
-helper and loader because Step4 does not call that API. No training,
+helper and loader because Step5 does not call that API. No training,
 experimental, benchmark, testing, or backward-only subtree is copied and no
 packaging prune rule is used as a substitute for a minimal source inventory.
 

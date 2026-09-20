@@ -277,7 +277,7 @@ fn serve_args_forward_valid_vocab_size_to_frontend_and_managed_engine() {
     let cli = Cli::try_parse_from([
         "vllm-rs",
         "serve",
-        "/models/step4",
+        "/models/step5",
         "--valid-vocab-size",
         "128815",
     ])
@@ -305,9 +305,9 @@ fn serve_args_forward_tokenizer_to_frontend_and_managed_engine() {
     let cli = Cli::try_parse_from([
         "vllm-rs",
         "serve",
-        "/models/step4",
+        "/models/step5",
         "--tokenizer",
-        "/models/step4-tokenizer",
+        "/models/step5-tokenizer",
     ])
     .unwrap();
 
@@ -316,13 +316,13 @@ fn serve_args_forward_tokenizer_to_frontend_and_managed_engine() {
     };
     assert_eq!(
         args.runtime.tokenizer.as_deref(),
-        Some("/models/step4-tokenizer")
+        Some("/models/step5-tokenizer")
     );
 
     let frontend_config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
     assert_eq!(
         frontend_config.tokenizer.as_deref(),
-        Some("/models/step4-tokenizer")
+        Some("/models/step5-tokenizer")
     );
 
     let engine_config = args.to_managed_engine_config(5555);
@@ -330,7 +330,7 @@ fn serve_args_forward_tokenizer_to_frontend_and_managed_engine() {
         engine_config
             .python_args
             .windows(2)
-            .any(|args| args == ["--tokenizer", "/models/step4-tokenizer"])
+            .any(|args| args == ["--tokenizer", "/models/step5-tokenizer"])
     );
 }
 
@@ -340,7 +340,7 @@ fn serve_args_reject_zero_valid_vocab_size() {
         Cli::try_parse_from([
             "vllm-rs",
             "serve",
-            "/models/step4",
+            "/models/step5",
             "--valid-vocab-size",
             "0",
         ])
@@ -977,7 +977,7 @@ fn frontend_args_json_accepts_independent_tokenizer() {
         "--output-address",
         "ipc:///tmp/output.sock",
         "--args-json",
-        r#"{"model_tag":"/models/step4","tokenizer":"/models/step4-tokenizer"}"#,
+        r#"{"model_tag":"/models/step5","tokenizer":"/models/step5-tokenizer"}"#,
     ])
     .unwrap();
 
@@ -986,11 +986,11 @@ fn frontend_args_json_accepts_independent_tokenizer() {
     };
     assert_eq!(
         args.runtime.tokenizer.as_deref(),
-        Some("/models/step4-tokenizer")
+        Some("/models/step5-tokenizer")
     );
 
     let config = args.into_config();
-    assert_eq!(config.tokenizer.as_deref(), Some("/models/step4-tokenizer"));
+    assert_eq!(config.tokenizer.as_deref(), Some("/models/step5-tokenizer"));
 }
 
 #[test]

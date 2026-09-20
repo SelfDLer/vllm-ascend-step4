@@ -17,7 +17,7 @@ from vllm.config import CompilationConfig, PassConfig, VllmConfig
 from vllm.platforms import current_platform
 
 
-class AddThenStep4RMSNorm(torch.nn.Module):
+class AddThenStep5RMSNorm(torch.nn.Module):
     def __init__(self, norm: torch.nn.Module) -> None:
         super().__init__()
         self.norm = norm
@@ -34,9 +34,9 @@ class AddThenStep4RMSNorm(torch.nn.Module):
 
 
 @pytest.mark.parametrize("epsilon", [1e-5, 1e-6])
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Step4 fusion is CUDA-only")
-def test_step4_add_rmsnorm_fusion(epsilon: float) -> None:
-    from vllm.models.step4.layernorm import Step4RMSNorm
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Step5 fusion is CUDA-only")
+def test_step5_add_rmsnorm_fusion(epsilon: float) -> None:
+    from vllm.models.step5.layernorm import Step5RMSNorm
 
     config = VllmConfig(
         compilation_config=CompilationConfig(
@@ -46,13 +46,13 @@ def test_step4_add_rmsnorm_fusion(epsilon: float) -> None:
 
     with vllm.config.set_current_vllm_config(config):
         torch.set_default_device("cuda")
-        norm = Step4RMSNorm(
+        norm = Step5RMSNorm(
             256,
             eps=epsilon,
             zero_centered=True,
             dtype=torch.float32,
         )
-        model = AddThenStep4RMSNorm(norm)
+        model = AddThenStep5RMSNorm(norm)
         input = torch.randn(17, 256, dtype=torch.float32)
         residual = torch.randn_like(input)
         expected = model(input, residual)

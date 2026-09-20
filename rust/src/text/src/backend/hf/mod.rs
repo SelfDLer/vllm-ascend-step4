@@ -295,9 +295,9 @@ mod tests {
     }
 
     #[test]
-    fn step4_defaults_valid_vocab_size_to_tokenizer_length() {
+    fn step5_defaults_valid_vocab_size_to_tokenizer_length() {
         let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"step4","vocab_size":128896}"#).unwrap();
+            serde_json::from_str(r#"{"model_type":"step5","vocab_size":128896}"#).unwrap();
 
         assert_eq!(
             resolve_valid_vocab_size(&model_config, 128896, 128815, None).unwrap(),
@@ -306,14 +306,14 @@ mod tests {
     }
 
     #[test]
-    fn nested_step4_metadata_overrides_incorrect_wrapper_values() {
+    fn nested_step5_metadata_overrides_incorrect_wrapper_values() {
         let model_config: ModelConfig = serde_json::from_str(
             r#"{
-                "model_type":"step4_multimodal",
+                "model_type":"step5_multimodal",
                 "vocab_size":1,
                 "eos_token_id":2,
                 "text_config":{
-                    "model_type":"step4",
+                    "model_type":"step5",
                     "vocab_size":128896,
                     "eos_token_id":[128815,128816]
                 }
@@ -340,9 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn step4_accepts_smaller_explicit_valid_vocab_size() {
+    fn step5_accepts_smaller_explicit_valid_vocab_size() {
         let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"step4","vocab_size":128896}"#).unwrap();
+            serde_json::from_str(r#"{"model_type":"step5","vocab_size":128896}"#).unwrap();
 
         assert_eq!(
             resolve_valid_vocab_size(&model_config, 128896, 128815, Some(128800)).unwrap(),
@@ -351,9 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn step4_rejects_invalid_explicit_valid_vocab_sizes() {
+    fn step5_rejects_invalid_explicit_valid_vocab_sizes() {
         let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"step4","vocab_size":128896}"#).unwrap();
+            serde_json::from_str(r#"{"model_type":"step5","vocab_size":128896}"#).unwrap();
 
         for valid_vocab_size in [0, 128816, 128897] {
             assert!(matches!(

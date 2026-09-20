@@ -82,7 +82,7 @@ class _LegacyMaxTokenIdTokenizer:
 def _make_model_config(
     *,
     valid_vocab_size: int | None = None,
-    architecture: str = "Step4ForCausalLM",
+    architecture: str = "Step5ForCausalLM",
     vocab_size: int = 128896,
     skip_tokenizer_init: bool = False,
 ) -> ModelConfig:
@@ -96,9 +96,9 @@ def _make_model_config(
 
 @pytest.mark.parametrize(
     "architecture",
-    ["Step4ForCausalLM", "Step4ForConditionalGeneration", "Step4MTP"],
+    ["Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"],
 )
-def test_step4_architectures_support_valid_vocab_size(architecture):
+def test_step5_architectures_support_valid_vocab_size(architecture):
     model_config = _make_model_config(architecture=architecture)
 
     assert model_config.supports_valid_vocab_size()
@@ -199,7 +199,7 @@ def test_valid_vocab_size_rejects_unsupported_architecture():
         architecture="Qwen2ForCausalLM",
     )
 
-    with pytest.raises(ValueError, match="only for Step4"):
+    with pytest.raises(ValueError, match="only for Step5"):
         model_config._verify_valid_vocab_size()
 
 
@@ -239,7 +239,7 @@ def test_resolve_explicit_valid_vocab_size_does_not_load_tokenizer(
 @pytest.mark.parametrize("method", ["mtp", "draft_model"])
 def test_vllm_config_syncs_valid_vocab_size_to_same_tokenizer_draft(method):
     target_config = _make_model_config()
-    draft_config = _make_model_config(architecture="Step4MTP")
+    draft_config = _make_model_config(architecture="Step5MTP")
     vllm_config = SimpleNamespace(
         model_config=target_config,
         speculative_config=SimpleNamespace(
@@ -257,7 +257,7 @@ def test_vllm_config_syncs_valid_vocab_size_to_same_tokenizer_draft(method):
     assert draft_config.get_valid_vocab_size() == 128815
 
 
-def test_vllm_config_revalidates_non_step4_draft_after_target_resolution():
+def test_vllm_config_revalidates_non_step5_draft_after_target_resolution():
     target_config = _make_model_config()
     draft_config = _make_model_config(
         architecture="Qwen2ForCausalLM",
@@ -281,10 +281,10 @@ def test_vllm_config_revalidates_non_step4_draft_after_target_resolution():
         )
 
 
-def test_vllm_config_resolves_heterogeneous_step4_draft_tokenizer(monkeypatch):
+def test_vllm_config_resolves_heterogeneous_step5_draft_tokenizer(monkeypatch):
     target_config = _make_model_config()
     draft_config = _make_model_config(
-        architecture="Step4ForCausalLM",
+        architecture="Step5ForCausalLM",
         vocab_size=65536,
     )
     draft_tokenizer = _FakeTokenizer(64000)
@@ -326,7 +326,7 @@ def test_draft_model_compares_effective_vocab_sizes():
         speculative_config.verify_equal_vocab_size_if_draft_model()
 
 
-def test_draft_model_defers_vocab_comparison_until_step4_is_resolved():
+def test_draft_model_defers_vocab_comparison_until_step5_is_resolved():
     speculative_config = object.__new__(SpeculativeConfig)
     speculative_config.method = "draft_model"
     speculative_config.target_model_config = _make_model_config()

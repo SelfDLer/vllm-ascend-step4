@@ -23,14 +23,14 @@ from . import silly_attention  # noqa: F401
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("use_aot", [False, True])
-def test_step4_mtp_layers_keep_distinct_compiled_constants(
+def test_step5_mtp_layers_keep_distinct_compiled_constants(
     tmp_path, monkeypatch, use_aot
 ):
     """Each draft layer must retain its own constants on cold and warm caches."""
     from types import SimpleNamespace
 
     from vllm.compilation.backends import set_model_tag
-    from vllm.models.step4 import mtp
+    from vllm.models.step5 import mtp
 
     @support_torch_compile
     class DraftLayer(nn.Module):
@@ -47,13 +47,13 @@ def test_step4_mtp_layers_keep_distinct_compiled_constants(
             spec_step_index: int,
         ) -> torch.Tensor:
             # A layer-specific constant stands in for the attention cache name
-            # embedded in Step4's compiled QKNorm/cache-write operation.
+            # embedded in Step5's compiled QKNorm/cache-write operation.
             return previous_hidden_states + self.layer_index
 
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
     monkeypatch.setenv("VLLM_USE_AOT_COMPILE", str(int(use_aot)))
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm"))
-    monkeypatch.setattr(mtp, "Step4MultiTokenPredictorLayer", DraftLayer)
+    monkeypatch.setattr(mtp, "Step5MultiTokenPredictorLayer", DraftLayer)
     monkeypatch.setattr(mtp, "VocabParallelEmbedding", lambda *a: nn.Identity())
     monkeypatch.setattr(mtp, "LogitsProcessor", lambda *a, **kw: nn.Identity())
     monkeypatch.setattr(mtp, "_require_resolved_valid_vocab_size", lambda _: 16)
@@ -79,7 +79,7 @@ def test_step4_mtp_layers_keep_distinct_compiled_constants(
     with torch.inference_mode(), set_current_vllm_config(config):
         for _ in range(2):
             with set_model_tag("eagle_head"):
-                model = mtp.Step4MultiTokenPredictor(vllm_config=config, prefix="model")
+                model = mtp.Step5MultiTokenPredictor(vllm_config=config, prefix="model")
             with set_forward_context({}, vllm_config=config):
                 for step in range(3):
                     actual = model(ids, ids, hidden, hidden, spec_step_idx=step)

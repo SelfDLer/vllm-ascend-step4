@@ -10,9 +10,9 @@ import regex as re
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "OPTIMUS_JIT_VENDOR_MANIFEST.tsv"
 VENDORED_ROOTS = (
-    REPO_ROOT / "vllm" / "models" / "step4" / "nvidia" / "ops" / "cute_dsl",
-    REPO_ROOT / "vllm" / "models" / "step4" / "nvidia" / "ops" / "triton",
-    REPO_ROOT / "csrc" / "libtorch_stable" / "step4",
+    REPO_ROOT / "vllm" / "models" / "step5" / "nvidia" / "ops" / "cute_dsl",
+    REPO_ROOT / "vllm" / "models" / "step5" / "nvidia" / "ops" / "triton",
+    REPO_ROOT / "csrc" / "libtorch_stable" / "step5",
 )
 VENDORED_PREFIXES = tuple(
     PurePosixPath(root.relative_to(REPO_ROOT).as_posix()) for root in VENDORED_ROOTS
@@ -108,7 +108,7 @@ def test_optimus_vendor_manifest_matches_source_tree():
         assert relative_path.name != "optimus_jit_compile_log.py"
 
         if relative_path.is_relative_to(VENDORED_PREFIXES[-1]):
-            assert row["component"] == "step4_native"
+            assert row["component"] == "step5_native"
         else:
             assert row["component"] == "optimus_jit"
 

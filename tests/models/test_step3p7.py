@@ -9,7 +9,7 @@ from torch import nn
 
 import vllm.model_executor.models.step3p7 as step3p7_module
 from vllm.model_executor.models.step3p7 import Step3p7ForConditionalGeneration
-from vllm.model_executor.models.step4_vl import Step4ForConditionalGeneration
+from vllm.model_executor.models.step5_vl import Step5ForConditionalGeneration
 
 
 class _DummyLanguageModel(nn.Module):
@@ -18,8 +18,8 @@ class _DummyLanguageModel(nn.Module):
         self.make_empty_intermediate_tensors = object()
 
 
-def test_step4_checkpoint_weights_use_the_step3p7_mapper():
-    mapper = Step4ForConditionalGeneration.hf_to_vllm_mapper
+def test_step5_checkpoint_weights_use_the_step3p7_mapper():
+    mapper = Step5ForConditionalGeneration.hf_to_vllm_mapper
 
     assert mapper.apply_list(
         [
@@ -40,7 +40,7 @@ def test_step4_checkpoint_weights_use_the_step3p7_mapper():
 
 @pytest.mark.parametrize(
     "model_cls",
-    [Step3p7ForConditionalGeneration, Step4ForConditionalGeneration],
+    [Step3p7ForConditionalGeneration, Step5ForConditionalGeneration],
 )
 def test_step3p7_family_initializes_encoder_cudagraph_model_config(
     monkeypatch, model_cls

@@ -59,19 +59,19 @@ where = ["."]
 include = ["vllm*"]
 
 [tool.ruff]
-# The Step4 inference-only Optimus kernel closure is model-scoped. In
+# The Step5 inference-only Optimus kernel closure is model-scoped. In
 # particular, CuTeDSL staged kernels are source-inspected during JIT
 # compilation, so formatting them can change preprocessing semantics.
 extend-exclude = [
-    "vllm/models/step4/nvidia/ops/cute_dsl",
-    "vllm/models/step4/nvidia/ops/triton",
+    "vllm/models/step5/nvidia/ops/cute_dsl",
+    "vllm/models/step5/nvidia/ops/triton",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]
 # Model-scoped vendored Optimus inference kernels.
-"vllm/models/step4/nvidia/ops/cute_dsl/**" = ["ALL"]
-"vllm/models/step4/nvidia/ops/triton/**" = ["ALL"]
+"vllm/models/step5/nvidia/ops/cute_dsl/**" = ["ALL"]
+"vllm/models/step5/nvidia/ops/triton/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 

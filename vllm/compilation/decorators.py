@@ -540,7 +540,7 @@ def _support_torch_compile(
 
             factors.append(_model_hash_key(self.forward))
             # Independently compiled instances can embed different constants,
-            # such as the attention cache name of each Step4 MTP layer.
+            # such as the attention cache name of each Step5 MTP layer.
             factors.append(self._compile_prefix)
             hash_key = hashlib.sha256(str(factors).encode()).hexdigest()
             cache_dir = os.path.join(

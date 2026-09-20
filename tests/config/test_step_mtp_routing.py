@@ -9,10 +9,10 @@ import vllm.config.speculative as speculative_module
 from vllm.config.compilation import CompilationMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
-from vllm.transformers_utils.configs.step4 import Step4VLConfig
+from vllm.transformers_utils.configs.step5 import Step5VLConfig
 
 
-@pytest.mark.parametrize("model_type", ["step3p5_mtp", "step4_mtp"])
+@pytest.mark.parametrize("model_type", ["step3p5_mtp", "step5_mtp"])
 def test_step_mtp_models_use_step_proposer(model_type):
     speculative_config = object.__new__(SpeculativeConfig)
     speculative_config.method = "mtp"
@@ -33,10 +33,10 @@ def test_non_step_mtp_model_does_not_use_step_proposer():
     assert not speculative_config.use_step_mtp()
 
 
-def test_step4_vl_mtp_promotes_the_nested_text_config():
-    target_config = Step4VLConfig(
+def test_step5_vl_mtp_promotes_the_nested_text_config():
+    target_config = Step5VLConfig(
         text_config={
-            "architectures": ["Step4ForCausalLM"],
+            "architectures": ["Step5ForCausalLM"],
             "num_hidden_layers": 2,
             "num_nextn_predict_layers": 3,
         }
@@ -45,8 +45,8 @@ def test_step4_vl_mtp_promotes_the_nested_text_config():
     draft_config = SpeculativeConfig.hf_config_override(target_config)
 
     assert draft_config is target_config.text_config
-    assert draft_config.model_type == "step4_mtp"
-    assert draft_config.architectures == ["Step4MTP"]
+    assert draft_config.model_type == "step5_mtp"
+    assert draft_config.architectures == ["Step5MTP"]
     assert draft_config.n_predict == 3
 
 
@@ -182,9 +182,9 @@ def test_heterogeneous_draft_uses_draft_tokenizer_revision(monkeypatch):
 
 @pytest.mark.parametrize(
     "architecture",
-    ["Step4ForCausalLM", "Step4ForConditionalGeneration", "Step4MTP"],
+    ["Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"],
 )
-def test_step4_models_are_rejected_by_v2_model_runner(architecture):
+def test_step5_models_are_rejected_by_v2_model_runner(architecture):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             architecture=architecture,
@@ -212,4 +212,4 @@ def test_step4_models_are_rejected_by_v2_model_runner(architecture):
 
     unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
 
-    assert "Step4 models" in unsupported
+    assert "Step5 models" in unsupported

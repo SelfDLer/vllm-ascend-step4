@@ -32,9 +32,9 @@ from .registry import HF_EXAMPLE_MODELS
 @create_new_process_for_each_test()
 @pytest.mark.parametrize(
     "model_arch",
-    ["Step4ForCausalLM", "Step4ForConditionalGeneration", "Step4MTP"],
+    ["Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"],
 )
-def test_step4_registry_import_is_cuda_safe(model_arch):
+def test_step5_registry_import_is_cuda_safe(model_arch):
     assert not torch.cuda.is_initialized()
 
     model_cls = ModelRegistry._try_load_model_cls(model_arch)
@@ -42,11 +42,11 @@ def test_step4_registry_import_is_cuda_safe(model_arch):
     assert model_cls is not None
     assert not torch.cuda.is_initialized()
     assert not any(
-        module.startswith("vllm.models.step4.nvidia.ops.cute_dsl")
+        module.startswith("vllm.models.step5.nvidia.ops.cute_dsl")
         for module in sys.modules
     )
     assert not any(
-        module.startswith("vllm.models.step4.nvidia.ops.triton")
+        module.startswith("vllm.models.step5.nvidia.ops.triton")
         for module in sys.modules
     )
 

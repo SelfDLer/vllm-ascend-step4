@@ -783,10 +783,10 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
-        # Step4 DSA consumes request-scoped Python metadata and updates a
+        # Step5 DSA consumes request-scoped Python metadata and updates a
         # persistent summary/MTP sidecar. It must run eagerly between PIECEWISE
         # graph segments; mutates_args alone cannot encode those replay semantics.
-        "vllm::step4_dsa_attention_with_output",
+        "vllm::step5_dsa_attention_with_output",
     ]
 
     def compute_hash(self) -> str:

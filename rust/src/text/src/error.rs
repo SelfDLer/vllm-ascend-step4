@@ -14,7 +14,7 @@ pub enum Error {
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
     #[error(
-        "valid_vocab_size is currently supported only for Step4 models, \
+        "valid_vocab_size is currently supported only for Step5 models, \
          got model_type {model_type:?}"
     )]
     UnsupportedValidVocabSize { model_type: Option<String> },

@@ -179,9 +179,7 @@ def test_prefix_cache_recompute_contract_deduplicates_eagle_drop():
         KVCacheConfig(
             num_blocks=64,
             kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(["layer"], spec, is_eagle_group=True)
-            ],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], spec, is_eagle_group=True)],
         ),
         max_model_len=8192,
         enable_caching=True,
@@ -221,7 +219,7 @@ def test_prefix_cache_recompute_contract_deduplicates_eagle_drop():
         (13391, True, 13312),
     ],
 )
-def test_prefix_cache_recompute_step4_boundaries(
+def test_prefix_cache_recompute_step5_boundaries(
     prompt_length: int,
     use_eagle: bool,
     expected_hit: int,
@@ -338,9 +336,7 @@ def test_prefix_cache_recompute_contract_keeps_hybrid_groups_aligned():
         enable_caching=True,
         hash_block_size=hash_block_size,
     )
-    token_ids = [
-        i for i in range(16) for _ in range(hash_block_size)
-    ]
+    token_ids = [i for i in range(16) for _ in range(hash_block_size)]
     producer = make_request("producer", token_ids, hash_block_size, sha256)
     producer_blocks, _, _ = manager.get_computed_blocks(producer)
     assert manager.allocate_slots(

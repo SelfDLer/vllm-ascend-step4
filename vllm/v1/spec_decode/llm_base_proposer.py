@@ -1505,7 +1505,7 @@ class SpecDecodeBaseProposer:
                 "Gemma4ForConditionalGeneration",
                 "Gemma4UnifiedForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",
-                "Step4ForConditionalGeneration",
+                "Step5ForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = target_model.config.image_token_id
             elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
